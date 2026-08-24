@@ -37,7 +37,8 @@ class DesktopApp:
         os.environ["TASK_CONFIG"] = str(CONFIG_PATH)
         os.environ["ARTIFACTS_DIR"] = str(ARTIFACTS_DIR)
         os.environ["DOUYIN_STORAGE_STATE"] = str(STATE_PATH)
-        os.environ.setdefault("HEADLESS", "true")\n        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+        os.environ.setdefault("HEADLESS", "true")
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
         if not CONFIG_PATH.exists():
             CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
 
