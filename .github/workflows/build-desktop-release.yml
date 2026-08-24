@@ -32,7 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
-          PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium
+          python -m playwright install chromium
       - name: Build application
         shell: bash
         run: |
@@ -44,11 +44,15 @@ jobs:
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "dist/SBS-Spark/*" -DestinationPath "${{ matrix.artifact }}.zip"
+        run: |
+          Copy-Item -Recurse "$env:LOCALAPPDATA\ms-playwright" "dist\SBS-Spark\ms-playwright"
+          Compress-Archive -Path "dist/SBS-Spark/*" -DestinationPath "${{ matrix.artifact }}.zip"
       - name: Package macOS
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          mkdir -p "dist/SBS-Spark.app/Contents/Resources"
+          cp -R "$HOME/Library/Caches/ms-playwright" "dist/SBS-Spark.app/Contents/Resources/ms-playwright"
           mkdir dmg
           cp -R "dist/SBS-Spark.app" dmg/
           hdiutil create -volname "SBS Spark" -srcfolder dmg -ov -format UDZO "${{ matrix.artifact }}.dmg"
