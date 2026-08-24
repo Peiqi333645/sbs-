@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller customtkinter pillow
           python -m playwright install chromium
       - name: Build application
         shell: bash
@@ -39,6 +39,8 @@ jobs:
           pyinstaller --noconfirm --clean --windowed --onedir \
             --name "SBS-Spark" \
             --collect-all playwright \
+            --collect-all customtkinter \
+            --collect-all PIL \
             --collect-submodules app \
             desktop_app.py
       - name: Package Windows
