@@ -1,0 +1,70 @@
+name: Build desktop release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: SBS-Spark-Windows-x64
+          - os: macos-14
+            artifact: SBS-Spark-macOS-Apple-Silicon
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium
+      - name: Build application
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir \
+            --name "SBS-Spark" \
+            --collect-all playwright \
+            --collect-submodules app \
+            desktop_app.py
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/SBS-Spark/*" -DestinationPath "${{ matrix.artifact }}.zip"
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir dmg
+          cp -R "dist/SBS-Spark.app" dmg/
+          hdiutil create -volname "SBS Spark" -srcfolder dmg -ov -format UDZO "${{ matrix.artifact }}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.dmg
+          if-no-files-found: error
+
+      - name: Attach files to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.dmg
+          generate_release_notes: true
