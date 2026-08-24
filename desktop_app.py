@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import sys
 import threading
 import time
@@ -45,6 +46,16 @@ ARTIFACTS_DIR = DATA_DIR / "artifacts"
 SETTINGS_PATH = DATA_DIR / "desktop-settings.json"
 QR_PATH = DATA_DIR / "login-qr.png"
 DAILY_STATUS_PATH = DATA_DIR / "daily-status.json"
+ACCOUNTS_DIR = DATA_DIR / "accounts"
+ACCOUNTS_PATH = DATA_DIR / "accounts.json"
+
+RANDOM_MESSAGES = [
+    "今天也要开心呀 ✨",
+    "记得照顾好自己，保持好心情～",
+    "忙完记得休息一下呀",
+    "愿你今天一切顺利 😊",
+    "来和你打个招呼，祝你今天愉快",
+]
 
 DEFAULT_CONFIG = {
     "friends": ["好友昵称"],
@@ -68,6 +79,9 @@ class DesktopApp:
         self.daily_plan: list[dict] = []
         self.risk_stopped = False
         self.active_plan_item: dict | None = None
+        self.accounts: list[dict] = []
+        self.current_account_id = ""
+        self.pending_new_account = False
 
         self._prepare_runtime()
         self._build_ui()
@@ -79,6 +93,8 @@ class DesktopApp:
 
     def _prepare_runtime(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+        self._load_account_registry()
         os.chdir(DATA_DIR)
         os.environ["TASK_CONFIG"] = str(CONFIG_PATH)
         os.environ["ARTIFACTS_DIR"] = str(ARTIFACTS_DIR)
@@ -145,7 +161,13 @@ class DesktopApp:
             text_color="#D9D9D9",
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self.run_badge.pack(side="right", padx=30)
+        self.run_badge.pack(side="right", padx=(10, 30))
+        self.risk_badge = ctk.CTkLabel(
+            header, text="●  状态正常", width=112, height=34, corner_radius=17,
+            fg_color="#173D2C", text_color="#6FE0A5",
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.risk_badge.pack(side="right")
 
         body = ctk.CTkScrollableFrame(
             shell, fg_color=CANVAS, scrollbar_button_color="#D2D2CD"
@@ -155,8 +177,28 @@ class DesktopApp:
         body.grid_columnconfigure(1, weight=1)
 
         login_card = self._card(body, 0, 0, "01", "账号登录", "扫码后登录状态仅保存在本机")
+        account_row = ctk.CTkFrame(login_card, fg_color="#FAFAF8", corner_radius=12)
+        account_row.pack(fill="x", padx=22, pady=(4, 10))
+        ctk.CTkLabel(
+            account_row, text="当前账号", text_color=MUTED, font=ctk.CTkFont(size=11)
+        ).pack(side="left", padx=(14, 8), pady=10)
+        self.account_name = ctk.StringVar(value=self._current_account_name())
+        self.account_menu = ctk.CTkOptionMenu(
+            account_row, variable=self.account_name,
+            values=self._account_names() or ["暂无账号"],
+            command=self._account_selected, width=126, height=34,
+            fg_color="#EFEFED", button_color="#E1E1DD",
+            button_hover_color="#D5D5D0", text_color=INK
+        )
+        self.account_menu.pack(side="left", pady=8)
+        ctk.CTkButton(
+            account_row, text="＋ 添加账号", width=96, height=34, corner_radius=10,
+            fg_color=INK, hover_color="#333333", text_color="#FFFFFF",
+            command=self.add_account
+        ).pack(side="right", padx=8, pady=8)
+
         login_row = ctk.CTkFrame(login_card, fg_color="transparent")
-        login_row.pack(fill="x", padx=22, pady=(4, 22))
+        login_row.pack(fill="x", padx=22, pady=(0, 18))
         self.login_dot = ctk.CTkLabel(
             login_row, text="●", width=18, text_color=MUTED, font=ctk.CTkFont(size=17)
         )
@@ -381,9 +423,15 @@ class DesktopApp:
     def save_config(self, silent: bool = False):
         friends = [line.strip() for line in self.friends.get("1.0", "end").splitlines() if line.strip()]
         messages = [line.strip() for line in self.messages.get("1.0", "end").splitlines() if line.strip()]
-        if not friends or not messages:
+        if not friends:
             if not silent:
-                messagebox.showwarning(APP_NAME, "请至少填写一位互动对象和一条发送内容。")
+                messagebox.showwarning(APP_NAME, "请至少填写一位互动对象。")
+            return False
+        if not messages and self.message_mode.get() == "随机选择":
+            messages = list(RANDOM_MESSAGES)
+        if not messages:
+            if not silent:
+                messagebox.showwarning(APP_NAME, "固定发送模式需要至少填写一条内容。")
             return False
         if len(friends) > 10:
             if not silent:
@@ -412,11 +460,17 @@ class DesktopApp:
         return True
 
     def _refresh_login_state(self):
-        logged_in = STATE_PATH.exists()
+        logged_in = STATE_PATH.exists() and bool(self.current_account_id)
         self.login_dot.configure(text_color=GREEN if logged_in else MUTED)
         self.login_text.configure(text="已登录" if logged_in else "未登录")
         self.login_button.configure(text="重新扫码" if logged_in else "扫码登录")
         self.logout_button.configure(state="normal" if logged_in else "disabled")
+
+    def add_account(self):
+        if self.busy:
+            return
+        self.pending_new_account = True
+        self.start_qr_login()
 
     def start_qr_login(self):
         if self.busy:
@@ -573,8 +627,23 @@ class DesktopApp:
         self.qr_label.configure(image=self.qr_image, text="")
 
     def _login_success(self):
+        if self.pending_new_account or not self.current_account_id:
+            number = 1
+            names = set(self._account_names())
+            while f"账号 {number}" in names:
+                number += 1
+            account = {"id": f"account-{int(time.time())}", "name": f"账号 {number}"}
+            self.accounts.append(account)
+            self.current_account_id = account["id"]
+        account_path = self._current_account_path()
+        if account_path:
+            shutil.copyfile(STATE_PATH, account_path)
+        self.pending_new_account = False
+        self._save_account_registry()
+        self._refresh_account_menu()
         self._refresh_login_state()
-        self.activity_text.configure(text="账号登录成功")
+        self.risk_badge.configure(text="●  状态正常", fg_color="#173D2C", text_color="#6FE0A5")
+        self.activity_text.configure(text=f"{self._current_account_name()} 登录成功")
         if self.login_window and self.login_window.winfo_exists():
             self.login_window.destroy()
         messagebox.showinfo(APP_NAME, "登录成功，登录状态已安全保存在本机。")
@@ -584,11 +653,95 @@ class DesktopApp:
             self.qr_label.configure(text=error, image=None)
         self.activity_text.configure(text="登录失败，请重试")
 
-    def logout(self):
+    def _load_account_registry(self):
+        if ACCOUNTS_PATH.exists():
+            try:
+                payload = json.loads(ACCOUNTS_PATH.read_text(encoding="utf-8"))
+                self.accounts = payload.get("accounts", [])
+                self.current_account_id = payload.get("current", "")
+            except Exception:
+                self.accounts = []
+                self.current_account_id = ""
+        if STATE_PATH.exists() and not self.accounts:
+            account = {"id": "account-1", "name": "账号 1"}
+            self.accounts = [account]
+            self.current_account_id = account["id"]
+            shutil.copyfile(STATE_PATH, ACCOUNTS_DIR / "account-1.json")
+            self._save_account_registry()
+        self._activate_current_account()
+
+    def _save_account_registry(self):
+        ACCOUNTS_PATH.write_text(json.dumps({
+            "current": self.current_account_id,
+            "accounts": self.accounts,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _account_names(self):
+        return [item["name"] for item in self.accounts]
+
+    def _current_account_name(self):
+        item = next((a for a in self.accounts if a["id"] == self.current_account_id), None)
+        return item["name"] if item else "暂无账号"
+
+    def _current_account_path(self):
+        return ACCOUNTS_DIR / f"{self.current_account_id}.json" if self.current_account_id else None
+
+    def _daily_status_path(self):
+        return ACCOUNTS_DIR / f"{self.current_account_id}-daily.json" if self.current_account_id else DAILY_STATUS_PATH
+
+    def _activate_current_account(self):
+        path = self._current_account_path()
+        if path and path.exists():
+            shutil.copyfile(path, STATE_PATH)
+        elif STATE_PATH.exists():
+            STATE_PATH.unlink()
+
+    def _refresh_account_menu(self):
+        values = self._account_names() or ["暂无账号"]
+        self.account_menu.configure(values=values)
+        self.account_name.set(self._current_account_name())
+
+    def _account_selected(self, selected: str):
+        account = next((a for a in self.accounts if a["name"] == selected), None)
+        if not account or account["id"] == self.current_account_id:
+            return
+        if self.busy:
+            self.account_name.set(self._current_account_name())
+            messagebox.showwarning(APP_NAME, "任务运行中，暂时不能切换账号。")
+            return
+        self.current_account_id = account["id"]
+        self._activate_current_account()
+        self.daily_plan = []
+        self.risk_stopped = False
+        self._load_daily_plan()
+        self._save_account_registry()
+        self._refresh_login_state()
+        self._render_target_status()
+        self.risk_badge.configure(text="●  状态正常", fg_color="#173D2C", text_color="#6FE0A5")
+        self.activity_text.configure(text=f"已切换到 {selected}")
+
+    def _invalidate_current_account(self):
+        path = self._current_account_path()
+        if path and path.exists():
+            path.unlink()
         if STATE_PATH.exists():
             STATE_PATH.unlink()
+
+    def logout(self):
+        if not self.current_account_id:
+            return
+        current = self.current_account_id
+        self._invalidate_current_account()
+        self.accounts = [a for a in self.accounts if a["id"] != current]
+        self.current_account_id = self.accounts[0]["id"] if self.accounts else ""
+        self._activate_current_account()
+        self.daily_plan = []
+        self._load_daily_plan()
+        self._save_account_registry()
+        self._refresh_account_menu()
         self._refresh_login_state()
-        self.activity_text.configure(text="已退出登录")
+        self._render_target_status()
+        self.activity_text.configure(text="当前账号已退出并移除")
 
     def start_run(self, dry_run: bool):
         if self.busy:
@@ -651,10 +804,11 @@ class DesktopApp:
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _load_daily_plan(self):
-        if not DAILY_STATUS_PATH.exists():
+        status_path = self._daily_status_path()
+        if not status_path.exists():
             return
         try:
-            payload = json.loads(DAILY_STATUS_PATH.read_text(encoding="utf-8"))
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
             if payload.get("date") == datetime.now().strftime("%Y-%m-%d"):
                 self.daily_plan = payload.get("items", [])
                 self.risk_stopped = bool(payload.get("risk_stopped", False))
@@ -676,7 +830,10 @@ class DesktopApp:
             start = now + timedelta(minutes=2)
             end = now + timedelta(hours=2)
         span = max(1, int((end - start).total_seconds()))
-        slots = sorted(random.sample(range(span), min(len(friends), span))) if friends else []
+        count = len(friends)
+        bucket = span / max(1, count)
+        slots = [min(span - 1, int(i * bucket + random.uniform(bucket * 0.18, bucket * 0.82)))
+                 for i in range(count)]
         self.daily_plan = [{
             "friend": friend,
             "time": (start + timedelta(seconds=slots[i])).isoformat(timespec="seconds"),
@@ -687,7 +844,7 @@ class DesktopApp:
         self._persist_daily_plan(today)
 
     def _persist_daily_plan(self, date: str | None = None):
-        DAILY_STATUS_PATH.write_text(json.dumps({
+        self._daily_status_path().write_text(json.dumps({
             "date": date or datetime.now().strftime("%Y-%m-%d"),
             "risk_stopped": self.risk_stopped,
             "items": self.daily_plan,
@@ -761,8 +918,8 @@ class DesktopApp:
             item["error"] = str(exc)
             self.risk_stopped = True
             self.schedule_enabled.set(False)
-            if isinstance(exc, AuthenticationError) and STATE_PATH.exists():
-                STATE_PATH.unlink()
+            if isinstance(exc, AuthenticationError):
+                self._invalidate_current_account()
             self.root.after(0, lambda: self._emergency_stop(str(exc)))
         except Exception as exc:
             item["status"] = "failed"
@@ -782,6 +939,7 @@ class DesktopApp:
         self._refresh_login_state()
         self.activity_text.configure(text=f"已自动停止：{reason[:52]}")
         self.run_badge.configure(text="●  已安全停止", fg_color=RED, text_color="#FFFFFF")
+        self.risk_badge.configure(text="●  高风险/异常", fg_color="#8E1F1F", text_color="#FFFFFF")
         messagebox.showwarning(APP_NAME, f"检测到风险或登录异常，今天剩余任务已立即停止。\n\n{reason}")
 
 
@@ -794,6 +952,10 @@ class DesktopApp:
             self.run_badge.configure(
                 text=f"●  {label}", fg_color=color, text_color=text_color
             )
+            if busy and not self.risk_stopped:
+                self.risk_badge.configure(text="●  实时检测中", fg_color="#173D2C", text_color="#6FE0A5")
+            elif not busy and not self.risk_stopped:
+                self.risk_badge.configure(text="●  状态正常", fg_color="#173D2C", text_color="#6FE0A5")
             state = "disabled" if busy else "normal"
             self.run_button.configure(state=state)
             self.test_button.configure(state=state)
