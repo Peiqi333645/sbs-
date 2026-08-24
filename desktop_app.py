@@ -260,7 +260,7 @@ class DesktopApp:
         )
         self.target_status_frame.pack(fill="x", padx=22, pady=(0, 18))
 
-        message_card = self._card(body, 1, 0, "03", "发送内容", "每天随机选择一条，不需要编辑配置文件")
+        message_card = self._card(body, 1, 0, "03", "发送内容", "可指定固定文案，也可从多条文案中随机选择")
         self.messages = ctk.CTkTextbox(
             message_card,
             height=124,
@@ -432,7 +432,7 @@ class DesktopApp:
             messages = list(RANDOM_MESSAGES)
         if not messages:
             if not silent:
-                messagebox.showwarning(APP_NAME, "固定发送模式需要至少填写一条内容。")
+                messagebox.showwarning(APP_NAME, "指定内容模式需要至少填写一条内容。")
             return False
         if len(friends) > 10:
             if not silent:
