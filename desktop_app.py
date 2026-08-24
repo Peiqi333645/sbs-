@@ -532,8 +532,13 @@ class DesktopApp:
             fg_color="#E9E9E6",
             hover_color="#DCDCD8",
             text_color=INK,
-            command=window.destroy,
+            command=self._cancel_login,
         ).pack(pady=18)
+
+    def _cancel_login(self):
+        self.pending_new_account = False
+        if self.login_window and self.login_window.winfo_exists():
+            self.login_window.destroy()
 
     def _qr_login_worker(self):
         try:
@@ -773,9 +778,15 @@ class DesktopApp:
             self.root.after(0, lambda: self.activity_text.configure(
                 text=f"{label} · {datetime.now():%H:%M}"
             ))
+        except (AuthenticationError, RiskControlError) as exc:
+            self.risk_stopped = True
+            self.schedule_enabled.set(False)
+            if isinstance(exc, AuthenticationError):
+                self._invalidate_current_account()
+            self.root.after(0, lambda: self._emergency_stop(str(exc)))
         except Exception as exc:
             self.root.after(0, lambda: self.activity_text.configure(
-                text=f"运行失败：{str(exc)[:48]}"
+                text=f"检查失败：{str(exc)[:48]}"
             ))
         finally:
             self._set_busy(False, "空闲")
