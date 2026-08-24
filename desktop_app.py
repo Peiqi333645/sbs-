@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import platform
+import sys
 import threading
 import time
 from datetime import datetime
@@ -38,7 +39,14 @@ class DesktopApp:
         os.environ["ARTIFACTS_DIR"] = str(ARTIFACTS_DIR)
         os.environ["DOUYIN_STORAGE_STATE"] = str(STATE_PATH)
         os.environ.setdefault("HEADLESS", "true")
-        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+        if getattr(sys, "frozen", False):
+            executable_dir = Path(sys.executable).resolve().parent
+            browser_dir = (
+                executable_dir.parent / "Resources" / "ms-playwright"
+                if platform.system() == "Darwin"
+                else executable_dir / "ms-playwright"
+            )
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_dir)
         if not CONFIG_PATH.exists():
             CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
 
