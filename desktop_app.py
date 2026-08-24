@@ -9,30 +9,68 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
 
-from app.main import run
+import customtkinter as ctk
+from PIL import Image
+from tkinter import messagebox
 from playwright.async_api import async_playwright
 
-APP_NAME = "SBS 好友互动助手"
-DATA_DIR = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "Library/Application Support" if platform.system() == "Darwin" else Path.home() / ".local/share")) / "SBS-Spark"
+from app.main import run
+
+
+APP_NAME = "SBS Spark"
+YELLOW = "#FFBE0B"
+YELLOW_HOVER = "#E5A900"
+INK = "#141414"
+SURFACE = "#FFFFFF"
+CANVAS = "#F4F4F2"
+MUTED = "#707070"
+BORDER = "#E6E6E2"
+GREEN = "#20A464"
+RED = "#E94B4B"
+
+DATA_DIR = Path(
+    os.getenv("LOCALAPPDATA")
+    or (
+        Path.home() / "Library/Application Support"
+        if platform.system() == "Darwin"
+        else Path.home() / ".local/share"
+    )
+) / "SBS-Spark"
 CONFIG_PATH = DATA_DIR / "config.json"
 STATE_PATH = DATA_DIR / "storage-state.json"
 ARTIFACTS_DIR = DATA_DIR / "artifacts"
 SETTINGS_PATH = DATA_DIR / "desktop-settings.json"
+QR_PATH = DATA_DIR / "login-qr.png"
 
 DEFAULT_CONFIG = {
     "friends": ["好友昵称"],
     "messages": [{"type": "text", "value": "今天也要开心呀 ✨"}],
-    "send_interval_seconds": {"min": 3, "max": 8},
-    "prevent_duplicates": False,
+    "send_interval_seconds": {"min": 15, "max": 30},
+    "prevent_duplicates": True,
+    "continue_on_error": False,
     "target_open_retries": 1,
     "target_open_timeout_seconds": 15,
 }
 
+
 class DesktopApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: ctk.CTk):
+        self.root = root
+        self.busy = False
+        self.last_schedule_day = ""
+        self.login_window: ctk.CTkToplevel | None = None
+        self.qr_label: ctk.CTkLabel | None = None
+        self.qr_image = None
+
+        self._prepare_runtime()
+        self._build_ui()
+        self._load_config()
+        self._load_settings()
+        self._refresh_login_state()
+        threading.Thread(target=self._scheduler_loop, daemon=True).start()
+
+    def _prepare_runtime(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         os.chdir(DATA_DIR)
         os.environ["TASK_CONFIG"] = str(CONFIG_PATH)
@@ -48,158 +86,544 @@ class DesktopApp:
             )
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_dir)
         if not CONFIG_PATH.exists():
-            CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+            CONFIG_PATH.write_text(
+                json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
-        self.root = root
+    def _build_ui(self):
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
         self.root.title(APP_NAME)
-        self.root.geometry("860x650")
-        self.root.minsize(720, 560)
-        self.busy = False
-        self.login_ready = threading.Event()
-        self.last_schedule_day = ""
-        self._build()
-        self._load_config()
-        self._load_settings()
-        self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
-        self._scheduler_thread.start()
-        self._log(f"数据保存在：{DATA_DIR}")
+        self.root.geometry("980x720")
+        self.root.minsize(900, 660)
+        self.root.configure(fg_color=CANVAS)
 
-    def _build(self):
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("Accent.TButton", foreground="#111111", background="#F4C430", font=("Arial", 11, "bold"))
+        shell = ctk.CTkFrame(self.root, fg_color=CANVAS, corner_radius=0)
+        shell.pack(fill="both", expand=True)
 
-        header = tk.Frame(self.root, bg="#F4C430", height=72)
+        header = ctk.CTkFrame(shell, fg_color=INK, height=86, corner_radius=0)
         header.pack(fill="x")
-        tk.Label(header, text="SBS", bg="#111111", fg="#F4C430", font=("Arial", 18, "bold"), padx=14, pady=8).pack(side="left", padx=18, pady=14)
-        tk.Label(header, text="好友互动助手", bg="#F4C430", fg="#111111", font=("Arial", 20, "bold")).pack(side="left")
-        self.status = tk.StringVar(value="空闲")
-        tk.Label(header, textvariable=self.status, bg="#26834A", fg="white", padx=12, pady=6).pack(side="right", padx=18)
+        header.pack_propagate(False)
 
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=16, pady=14)
-        config_tab = ttk.Frame(notebook)
-        log_tab = ttk.Frame(notebook)
-        notebook.add(config_tab, text="任务设置")
-        notebook.add(log_tab, text="运行记录")
+        logo = ctk.CTkFrame(header, width=48, height=48, fg_color=YELLOW, corner_radius=15)
+        logo.pack(side="left", padx=(30, 14), pady=19)
+        logo.pack_propagate(False)
+        ctk.CTkLabel(
+            logo, text="S", text_color=INK, font=ctk.CTkFont(size=24, weight="bold")
+        ).pack(expand=True)
 
-        form = ttk.Frame(config_tab, padding=12)
-        form.pack(fill="both", expand=True)
-        ttk.Label(form, text="好友昵称（每行一个）").grid(row=0, column=0, sticky="w")
-        self.friends = scrolledtext.ScrolledText(form, height=8, wrap="word")
-        self.friends.grid(row=1, column=0, sticky="nsew", padx=(0, 10), pady=(6, 14))
-        ttk.Label(form, text="随机文字（每行一条）").grid(row=0, column=1, sticky="w")
-        self.messages = scrolledtext.ScrolledText(form, height=8, wrap="word")
-        self.messages.grid(row=1, column=1, sticky="nsew", pady=(6, 14))
+        title_wrap = ctk.CTkFrame(header, fg_color="transparent")
+        title_wrap.pack(side="left", pady=18)
+        ctk.CTkLabel(
+            title_wrap,
+            text="SBS Spark",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(size=21, weight="bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            title_wrap,
+            text="轻量、清晰的好友互动管理",
+            text_color="#AFAFAF",
+            font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", pady=(1, 0))
 
-        schedule_box = ttk.LabelFrame(form, text="本地定时", padding=10)
-        schedule_box.grid(row=2, column=0, columnspan=2, sticky="ew")
-        ttk.Label(schedule_box, text="每天运行时间").pack(side="left")
-        self.schedule_time = tk.StringVar(value="21:00")
-        ttk.Entry(schedule_box, textvariable=self.schedule_time, width=8).pack(side="left", padx=8)
-        self.schedule_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(schedule_box, text="启用（软件需保持运行）", variable=self.schedule_enabled).pack(side="left", padx=8)
+        self.run_badge = ctk.CTkLabel(
+            header,
+            text="●  空闲",
+            width=100,
+            height=34,
+            corner_radius=17,
+            fg_color="#2B2B2B",
+            text_color="#D9D9D9",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.run_badge.pack(side="right", padx=30)
 
-        actions = ttk.Frame(form)
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=18)
-        ttk.Button(actions, text="保存设置", command=self.save_config).pack(side="left", padx=4)
-        ttk.Button(actions, text="扫码登录", command=self.start_login, style="Accent.TButton").pack(side="left", padx=4)
-        ttk.Button(actions, text="完成扫码", command=self.confirm_login).pack(side="left", padx=4)
-        ttk.Button(actions, text="检查任务", command=lambda: self.start_run(True)).pack(side="left", padx=4)
-        ttk.Button(actions, text="立即发送", command=lambda: self.start_run(False)).pack(side="left", padx=4)
-        ttk.Button(actions, text="打开数据目录", command=self.open_data_dir).pack(side="right", padx=4)
-        form.columnconfigure(0, weight=1)
-        form.columnconfigure(1, weight=1)
-        form.rowconfigure(1, weight=1)
+        body = ctk.CTkScrollableFrame(
+            shell, fg_color=CANVAS, scrollbar_button_color="#D2D2CD"
+        )
+        body.pack(fill="both", expand=True, padx=24, pady=20)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
 
-        self.log = scrolledtext.ScrolledText(log_tab, state="disabled", bg="#181818", fg="#D8D8D8", insertbackground="white", font=("Menlo", 11))
-        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+        login_card = self._card(body, 0, 0, "01", "账号登录", "扫码后登录状态仅保存在本机")
+        login_row = ctk.CTkFrame(login_card, fg_color="transparent")
+        login_row.pack(fill="x", padx=22, pady=(4, 22))
+        self.login_dot = ctk.CTkLabel(
+            login_row, text="●", width=18, text_color=MUTED, font=ctk.CTkFont(size=17)
+        )
+        self.login_dot.pack(side="left")
+        self.login_text = ctk.CTkLabel(
+            login_row,
+            text="未登录",
+            text_color=INK,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.login_text.pack(side="left", padx=(4, 0))
+        self.login_button = ctk.CTkButton(
+            login_row,
+            text="扫码登录",
+            width=108,
+            height=38,
+            corner_radius=12,
+            fg_color=YELLOW,
+            hover_color=YELLOW_HOVER,
+            text_color=INK,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.start_qr_login,
+        )
+        self.login_button.pack(side="right")
+        self.logout_button = ctk.CTkButton(
+            login_row,
+            text="退出",
+            width=60,
+            height=38,
+            corner_radius=12,
+            fg_color="#EFEFED",
+            hover_color="#E2E2DE",
+            text_color=INK,
+            command=self.logout,
+        )
+        self.logout_button.pack(side="right", padx=(0, 8))
+
+        target_card = self._card(body, 0, 1, "02", "互动对象", "填写聊天列表中显示的完整备注或昵称")
+        self.friends = ctk.CTkTextbox(
+            target_card,
+            height=112,
+            corner_radius=12,
+            border_width=1,
+            border_color=BORDER,
+            fg_color="#FAFAF8",
+            text_color=INK,
+            font=ctk.CTkFont(size=14),
+        )
+        self.friends.pack(fill="x", padx=22, pady=(4, 10))
+        ctk.CTkLabel(
+            target_card,
+            text="每行一个，建议控制在 10 人以内",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=24, pady=(0, 18))
+
+        message_card = self._card(body, 1, 0, "03", "发送内容", "每天随机选择一条，不需要编辑配置文件")
+        self.messages = ctk.CTkTextbox(
+            message_card,
+            height=124,
+            corner_radius=12,
+            border_width=1,
+            border_color=BORDER,
+            fg_color="#FAFAF8",
+            text_color=INK,
+            font=ctk.CTkFont(size=14),
+        )
+        self.messages.pack(fill="x", padx=22, pady=(4, 10))
+        ctk.CTkLabel(
+            message_card,
+            text="每行一条。避免广告、重复营销或大量相同内容",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=24, pady=(0, 18))
+
+        schedule_card = self._card(body, 1, 1, "04", "运行设置", "电脑开机且软件运行时按计划执行")
+        schedule_row = ctk.CTkFrame(schedule_card, fg_color="transparent")
+        schedule_row.pack(fill="x", padx=22, pady=(6, 12))
+        ctk.CTkLabel(
+            schedule_row, text="每天运行时间", text_color=INK, font=ctk.CTkFont(size=14)
+        ).pack(side="left")
+        self.schedule_time = ctk.StringVar(value="21:00")
+        self.time_entry = ctk.CTkEntry(
+            schedule_row,
+            textvariable=self.schedule_time,
+            width=86,
+            height=38,
+            corner_radius=11,
+            border_color=BORDER,
+            fg_color="#FAFAF8",
+            justify="center",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.time_entry.pack(side="right")
+
+        switch_row = ctk.CTkFrame(schedule_card, fg_color="#FAFAF8", corner_radius=12)
+        switch_row.pack(fill="x", padx=22, pady=(0, 20))
+        ctk.CTkLabel(
+            switch_row,
+            text="启用自动运行",
+            text_color=INK,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(side="left", padx=14, pady=13)
+        self.schedule_enabled = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            switch_row,
+            text="",
+            variable=self.schedule_enabled,
+            width=44,
+            progress_color=GREEN,
+            button_color="#FFFFFF",
+            button_hover_color="#FFFFFF",
+        ).pack(side="right", padx=14)
+
+        footer = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=18, border_width=1, border_color=BORDER)
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew", padx=7, pady=(8, 12))
+        footer.grid_columnconfigure(1, weight=1)
+
+        self.save_button = ctk.CTkButton(
+            footer,
+            text="保存设置",
+            width=112,
+            height=44,
+            corner_radius=13,
+            fg_color="#EFEFED",
+            hover_color="#E2E2DE",
+            text_color=INK,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.save_config,
+        )
+        self.save_button.grid(row=0, column=0, padx=(18, 10), pady=17)
+
+        self.activity_text = ctk.CTkLabel(
+            footer,
+            text="尚未运行",
+            text_color=MUTED,
+            anchor="w",
+            font=ctk.CTkFont(size=12),
+        )
+        self.activity_text.grid(row=0, column=1, sticky="ew", padx=6)
+
+        self.test_button = ctk.CTkButton(
+            footer,
+            text="安全检查",
+            width=108,
+            height=44,
+            corner_radius=13,
+            fg_color="#242424",
+            hover_color="#383838",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: self.start_run(True),
+        )
+        self.test_button.grid(row=0, column=2, padx=8)
+
+        self.run_button = ctk.CTkButton(
+            footer,
+            text="开始运行",
+            width=120,
+            height=44,
+            corner_radius=13,
+            fg_color=YELLOW,
+            hover_color=YELLOW_HOVER,
+            text_color=INK,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: self.start_run(False),
+        )
+        self.run_button.grid(row=0, column=3, padx=(0, 18))
+
+    def _card(self, parent, row: int, column: int, number: str, title: str, subtitle: str):
+        card = ctk.CTkFrame(
+            parent, fg_color=SURFACE, corner_radius=18, border_width=1, border_color=BORDER
+        )
+        card.grid(row=row, column=column, sticky="nsew", padx=7, pady=7)
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.pack(fill="x", padx=22, pady=(19, 12))
+        ctk.CTkLabel(
+            top,
+            text=number,
+            width=35,
+            height=25,
+            corner_radius=9,
+            fg_color="#FFF4CC",
+            text_color="#8A6300",
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side="left")
+        title_wrap = ctk.CTkFrame(top, fg_color="transparent")
+        title_wrap.pack(side="left", padx=10)
+        ctk.CTkLabel(
+            title_wrap,
+            text=title,
+            text_color=INK,
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            title_wrap,
+            text=subtitle,
+            text_color=MUTED,
+            font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", pady=(2, 0))
+        return card
 
     def _load_config(self):
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         self.friends.delete("1.0", "end")
         self.friends.insert("1.0", "\n".join(data.get("friends", [])))
-        texts = [m.get("value") or m.get("content", "") for m in data.get("messages", []) if m.get("type") == "text"]
+        texts = [
+            item.get("value") or item.get("content", "")
+            for item in data.get("messages", [])
+            if item.get("type") == "text"
+        ]
         self.messages.delete("1.0", "end")
         self.messages.insert("1.0", "\n".join(texts))
 
     def _load_settings(self):
         if SETTINGS_PATH.exists():
-            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            self.schedule_time.set(data.get("schedule_time", "21:00"))
-            self.schedule_enabled.set(bool(data.get("schedule_enabled", False)))
+            try:
+                data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                self.schedule_time.set(data.get("schedule_time", "21:00"))
+                self.schedule_enabled.set(bool(data.get("schedule_enabled", False)))
+            except Exception:
+                pass
 
-    def save_config(self):
-        friends = [x.strip() for x in self.friends.get("1.0", "end").splitlines() if x.strip()]
-        messages = [x.strip() for x in self.messages.get("1.0", "end").splitlines() if x.strip()]
+    def save_config(self, silent: bool = False):
+        friends = [line.strip() for line in self.friends.get("1.0", "end").splitlines() if line.strip()]
+        messages = [line.strip() for line in self.messages.get("1.0", "end").splitlines() if line.strip()]
+        schedule = self.schedule_time.get().strip()
+
         if not friends or not messages:
-            messagebox.showwarning(APP_NAME, "好友和消息都至少填写一项。")
+            if not silent:
+                messagebox.showwarning(APP_NAME, "请至少填写一位互动对象和一条发送内容。")
             return False
-        data = dict(DEFAULT_CONFIG)
-        data["friends"] = friends
-        data["messages"] = [{"type": "text", "value": x} for x in messages]
-        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        SETTINGS_PATH.write_text(json.dumps({"schedule_time": self.schedule_time.get().strip(), "schedule_enabled": self.schedule_enabled.get()}, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._log("设置已保存。")
+        if len(friends) > 10:
+            if not silent:
+                messagebox.showwarning(APP_NAME, "为降低账号风险，第一版最多设置 10 位互动对象。")
+            return False
+        try:
+            datetime.strptime(schedule, "%H:%M")
+        except ValueError:
+            if not silent:
+                messagebox.showwarning(APP_NAME, "运行时间请使用 24 小时格式，例如 21:00。")
+            return False
+
+        config = dict(DEFAULT_CONFIG)
+        config["friends"] = friends
+        config["messages"] = [{"type": "text", "value": text} for text in messages]
+        CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        SETTINGS_PATH.write_text(
+            json.dumps(
+                {
+                    "schedule_time": schedule,
+                    "schedule_enabled": self.schedule_enabled.get(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.activity_text.configure(text="设置已保存")
+        if not silent:
+            messagebox.showinfo(APP_NAME, "设置已保存。")
         return True
 
-    def start_login(self):
+    def _refresh_login_state(self):
+        logged_in = STATE_PATH.exists()
+        self.login_dot.configure(text_color=GREEN if logged_in else MUTED)
+        self.login_text.configure(text="已登录" if logged_in else "未登录")
+        self.login_button.configure(text="重新扫码" if logged_in else "扫码登录")
+        self.logout_button.configure(state="normal" if logged_in else "disabled")
+
+    def start_qr_login(self):
         if self.busy:
             return
-        self.login_ready.clear()
-        self._set_busy(True, "等待扫码")
-        threading.Thread(target=self._login_worker, daemon=True).start()
+        self._open_qr_window()
+        self._set_busy(True, "获取二维码")
+        threading.Thread(target=self._qr_login_worker, daemon=True).start()
 
-    def confirm_login(self):
-        self.login_ready.set()
+    def _open_qr_window(self):
+        if self.login_window and self.login_window.winfo_exists():
+            self.login_window.destroy()
+        window = ctk.CTkToplevel(self.root)
+        self.login_window = window
+        window.title("扫码登录")
+        window.geometry("420x520")
+        window.resizable(False, False)
+        window.configure(fg_color=CANVAS)
+        window.transient(self.root)
+        window.grab_set()
 
-    def _login_worker(self):
+        ctk.CTkLabel(
+            window,
+            text="使用抖音 App 扫码",
+            text_color=INK,
+            font=ctk.CTkFont(size=21, weight="bold"),
+        ).pack(pady=(28, 5))
+        ctk.CTkLabel(
+            window,
+            text="请在手机上完成登录确认",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=12),
+        ).pack()
+
+        qr_frame = ctk.CTkFrame(
+            window, width=286, height=286, fg_color="#FFFFFF", corner_radius=18
+        )
+        qr_frame.pack(pady=24)
+        qr_frame.pack_propagate(False)
+        self.qr_label = ctk.CTkLabel(
+            qr_frame,
+            text="正在获取二维码…",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=13),
+        )
+        self.qr_label.pack(expand=True)
+
+        ctk.CTkLabel(
+            window,
+            text="二维码只用于本次登录，不会上传到服务器",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=11),
+        ).pack()
+        ctk.CTkButton(
+            window,
+            text="取消",
+            width=100,
+            height=38,
+            corner_radius=12,
+            fg_color="#E9E9E6",
+            hover_color="#DCDCD8",
+            text_color=INK,
+            command=window.destroy,
+        ).pack(pady=18)
+
+    def _qr_login_worker(self):
         try:
-            asyncio.run(self._login())
-            self.root.after(0, lambda: messagebox.showinfo(APP_NAME, "登录状态保存成功。"))
-            self._log("扫码登录成功。")
+            asyncio.run(self._qr_login())
+            self.root.after(0, self._login_success)
         except Exception as exc:
-            self._log(f"登录失败：{exc}")
-            self.root.after(0, lambda: messagebox.showerror(APP_NAME, f"登录失败：{exc}"))
+            self.root.after(0, lambda: self._login_error(str(exc)))
         finally:
             self._set_busy(False, "空闲")
 
-    async def _login(self):
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=False)
+    async def _qr_login(self):
+        if QR_PATH.exists():
+            QR_PATH.unlink()
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
             context = await browser.new_context(locale="zh-CN")
             page = await context.new_page()
-            await page.goto("https://www.douyin.com/", wait_until="domcontentloaded")
-            self._log("请在弹出的浏览器中扫码并在手机确认，然后点击软件中的“完成扫码”。")
-            await asyncio.to_thread(self.login_ready.wait)
-            await page.goto("https://www.douyin.com/", wait_until="domcontentloaded")
+            await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=60_000)
+
             login = page.get_by_text("登录", exact=True)
-            if await login.count() and await login.first.is_visible():
-                raise RuntimeError("未检测到登录成功")
-            tmp = STATE_PATH.with_suffix(".tmp")
-            await context.storage_state(path=str(tmp))
+            if await login.count():
+                try:
+                    await login.first.click(timeout=8_000)
+                except Exception:
+                    pass
+            qr_tab = page.get_by_text("扫码登录", exact=True)
+            if await qr_tab.count():
+                try:
+                    await qr_tab.first.click(timeout=5_000)
+                except Exception:
+                    pass
+
+            qr = None
+            selectors = [
+                '[class*="qrcode"] img',
+                '[class*="qr-code"] img',
+                '[class*="login"] canvas',
+                '[class*="qrcode"] canvas',
+                'canvas',
+            ]
+            for _ in range(20):
+                for selector in selectors:
+                    candidate = page.locator(selector)
+                    if await candidate.count():
+                        for index in range(min(await candidate.count(), 4)):
+                            item = candidate.nth(index)
+                            try:
+                                box = await item.bounding_box()
+                                if box and box["width"] >= 120 and box["height"] >= 120:
+                                    qr = item
+                                    break
+                            except Exception:
+                                continue
+                    if qr is not None:
+                        break
+                if qr is not None:
+                    break
+                await page.wait_for_timeout(500)
+
+            if qr is None:
+                await browser.close()
+                raise RuntimeError("暂时没有获取到登录二维码，请稍后重试。")
+
+            await qr.screenshot(path=str(QR_PATH))
+            self.root.after(0, self._show_qr_image)
+
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                cookies = await context.cookies()
+                authenticated = any(
+                    cookie.get("name") in {"sessionid", "sessionid_ss", "sid_guard"}
+                    and cookie.get("value")
+                    for cookie in cookies
+                )
+                if authenticated:
+                    tmp = STATE_PATH.with_suffix(".tmp")
+                    await context.storage_state(path=str(tmp))
+                    tmp.replace(STATE_PATH)
+                    await browser.close()
+                    return
+                await page.wait_for_timeout(1500)
+
             await browser.close()
-            tmp.replace(STATE_PATH)
+            raise RuntimeError("二维码已过期，请重新扫码。")
+
+    def _show_qr_image(self):
+        if not self.qr_label or not QR_PATH.exists():
+            return
+        image = Image.open(QR_PATH).convert("RGB")
+        self.qr_image = ctk.CTkImage(light_image=image, dark_image=image, size=(248, 248))
+        self.qr_label.configure(image=self.qr_image, text="")
+
+    def _login_success(self):
+        self._refresh_login_state()
+        self.activity_text.configure(text="账号登录成功")
+        if self.login_window and self.login_window.winfo_exists():
+            self.login_window.destroy()
+        messagebox.showinfo(APP_NAME, "登录成功，登录状态已安全保存在本机。")
+
+    def _login_error(self, error: str):
+        if self.qr_label and self.qr_label.winfo_exists():
+            self.qr_label.configure(text=error, image=None)
+        self.activity_text.configure(text="登录失败，请重试")
+
+    def logout(self):
+        if STATE_PATH.exists():
+            STATE_PATH.unlink()
+        self._refresh_login_state()
+        self.activity_text.configure(text="已退出登录")
 
     def start_run(self, dry_run: bool):
-        if self.busy or not self.save_config():
+        if self.busy:
+            return
+        if not self.save_config(silent=True):
+            messagebox.showwarning(APP_NAME, "请先补全互动对象、发送内容和运行时间。")
             return
         if not STATE_PATH.exists():
-            messagebox.showwarning(APP_NAME, "请先扫码登录。")
+            messagebox.showwarning(APP_NAME, "请先使用手机扫码登录。")
             return
-        self._set_busy(True, "检查中" if dry_run else "发送中")
+        if not dry_run:
+            confirmed = messagebox.askyesno(
+                APP_NAME,
+                "即将按当前设置发送消息。建议先执行一次“安全检查”，确认对象无误。是否继续？",
+            )
+            if not confirmed:
+                return
+        self._set_busy(True, "安全检查" if dry_run else "正在运行")
         threading.Thread(target=self._run_worker, args=(dry_run,), daemon=True).start()
 
     def _run_worker(self, dry_run: bool):
         try:
             code = asyncio.run(run(dry_run=dry_run))
-            self._log(("检查" if dry_run else "发送") + f"完成，退出码 {code}。")
+            label = "安全检查通过" if dry_run and code == 0 else (
+                "本次运行完成" if code == 0 else "运行完成，但存在失败"
+            )
+            self.root.after(0, lambda: self.activity_text.configure(
+                text=f"{label} · {datetime.now():%H:%M}"
+            ))
         except Exception as exc:
-            self._log(f"运行失败：{exc}")
-            self.root.after(0, lambda: messagebox.showerror(APP_NAME, f"运行失败：{exc}"))
+            self.root.after(0, lambda: self.activity_text.configure(
+                text=f"运行失败：{str(exc)[:48]}"
+            ))
         finally:
             self._set_busy(False, "空闲")
 
@@ -208,37 +632,40 @@ class DesktopApp:
             try:
                 now = datetime.now()
                 target = self.schedule_time.get().strip()
-                if self.schedule_enabled.get() and now.strftime("%H:%M") == target and self.last_schedule_day != now.strftime("%Y-%m-%d"):
-                    self.last_schedule_day = now.strftime("%Y-%m-%d")
+                today = now.strftime("%Y-%m-%d")
+                if (
+                    self.schedule_enabled.get()
+                    and now.strftime("%H:%M") == target
+                    and self.last_schedule_day != today
+                ):
+                    self.last_schedule_day = today
                     self.root.after(0, lambda: self.start_run(False))
             except Exception:
                 pass
             time.sleep(20)
 
-    def open_data_dir(self):
-        if platform.system() == "Windows":
-            os.startfile(DATA_DIR)
-        elif platform.system() == "Darwin":
-            os.system(f'open "{DATA_DIR}"')
-        else:
-            os.system(f'xdg-open "{DATA_DIR}"')
+    def _set_busy(self, busy: bool, label: str):
+        self.busy = busy
 
-    def _set_busy(self, value: bool, label: str):
-        self.busy = value
-        self.root.after(0, lambda: self.status.set(label))
+        def update():
+            color = YELLOW if busy else "#2B2B2B"
+            text_color = INK if busy else "#D9D9D9"
+            self.run_badge.configure(
+                text=f"●  {label}", fg_color=color, text_color=text_color
+            )
+            state = "disabled" if busy else "normal"
+            self.run_button.configure(state=state)
+            self.test_button.configure(state=state)
+            self.login_button.configure(state=state)
 
-    def _log(self, text: str):
-        def append():
-            self.log.configure(state="normal")
-            self.log.insert("end", f"[{datetime.now():%H:%M:%S}] {text}\n")
-            self.log.see("end")
-            self.log.configure(state="disabled")
-        self.root.after(0, append)
+        self.root.after(0, update)
+
 
 def main():
-    root = tk.Tk()
+    root = ctk.CTk()
     DesktopApp(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
