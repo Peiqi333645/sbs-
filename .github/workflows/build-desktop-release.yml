@@ -53,6 +53,8 @@ jobs:
         run: |
           mkdir -p "dist/SBS-Spark.app/Contents/Resources"
           cp -R "$HOME/Library/Caches/ms-playwright" "dist/SBS-Spark.app/Contents/Resources/ms-playwright"
+          codesign --force --deep --sign - "dist/SBS-Spark.app"
+          codesign --verify --deep --strict --verbose=2 "dist/SBS-Spark.app"
           mkdir dmg
           cp -R "dist/SBS-Spark.app" dmg/
           hdiutil create -volname "SBS Spark" -srcfolder dmg -ov -format UDZO "${{ matrix.artifact }}.dmg"
