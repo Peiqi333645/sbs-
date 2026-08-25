@@ -278,12 +278,10 @@ class DesktopApp:
             mode_row, text="发送方式", text_color=MUTED, font=ctk.CTkFont(size=11)
         ).pack(side="left")
         self.message_mode = ctk.StringVar(value="默认第一条")
-        ctk.CTkSegmentedButton(
-            mode_row, values=["默认第一条", "随机内容"], variable=self.message_mode,
-            selected_color=YELLOW, selected_hover_color=YELLOW_HOVER,
-            unselected_color="#FFFFFF", unselected_hover_color="#F3F3F0",
-            text_color=INK, corner_radius=10, border_width=1, fg_color=BORDER
-        ).pack(side="right")
+        self.message_mode_control = self._pill_selector(
+            mode_row, ["默认第一条", "随机内容"], self.message_mode
+        )
+        self.message_mode_control.pack(side="right")
 
         schedule_card = self._card(body, 1, 1, "04", "智能计划", "选择随机分散时间，或指定每天固定开始时间")
         plan_mode_row = ctk.CTkFrame(schedule_card, fg_color="transparent")
@@ -292,11 +290,8 @@ class DesktopApp:
             plan_mode_row, text="时间方式", text_color=MUTED, font=ctk.CTkFont(size=11)
         ).pack(side="left")
         self.plan_mode = ctk.StringVar(value="随机时间")
-        self.plan_mode_control = ctk.CTkSegmentedButton(
-            plan_mode_row, values=["随机时间", "固定时间"], variable=self.plan_mode,
-            selected_color=YELLOW, selected_hover_color=YELLOW_HOVER,
-            unselected_color="#FFFFFF", unselected_hover_color="#F3F3F0",
-            text_color=INK, corner_radius=10, border_width=1, fg_color=BORDER,
+        self.plan_mode_control = self._pill_selector(
+            plan_mode_row, ["随机时间", "固定时间"], self.plan_mode,
             command=self._plan_mode_changed
         )
         self.plan_mode_control.pack(side="right")
@@ -394,6 +389,40 @@ class DesktopApp:
             command=lambda: self.start_run(False),
         )
         self.run_button.grid(row=0, column=3, padx=(0, 18))
+
+    def _pill_selector(self, parent, values, variable, command=None):
+        track = ctk.CTkFrame(parent, fg_color="#EFEFED", corner_radius=15, height=38)
+        buttons = {}
+
+        def paint(*_):
+            current = variable.get()
+            for item_value, button in buttons.items():
+                selected = item_value == current
+                button.configure(
+                    fg_color=YELLOW if selected else "transparent",
+                    hover_color=YELLOW_HOVER if selected else "#E4E4DF",
+                    text_color=INK if selected else MUTED,
+                )
+
+        def choose(value, notify=True):
+            variable.set(value)
+            paint()
+            if notify and command:
+                command(value)
+
+        for index, value in enumerate(values):
+            button = ctk.CTkButton(
+                track, text=value, width=92, height=34, corner_radius=12,
+                border_width=0, fg_color="transparent",
+                hover_color="#E4E4DF", text_color=MUTED,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                command=lambda selected=value: choose(selected)
+            )
+            button.pack(side="left", padx=(2 if index == 0 else 0, 2), pady=2)
+            buttons[value] = button
+        variable.trace_add("write", paint)
+        choose(variable.get(), notify=False)
+        return track
 
     def _card(self, parent, row: int, column: int, number: str, title: str, subtitle: str):
         card = ctk.CTkFrame(
@@ -533,7 +562,7 @@ class DesktopApp:
         window = ctk.CTkToplevel(self.root)
         self.login_window = window
         window.title("扫码登录")
-        window.geometry("420x520")
+        window.geometry("460x590")
         window.resizable(False, False)
         window.configure(fg_color=CANVAS)
         window.transient(self.root)
@@ -553,7 +582,7 @@ class DesktopApp:
         ).pack()
 
         qr_frame = ctk.CTkFrame(
-            window, width=286, height=286, fg_color="#FFFFFF", corner_radius=18
+            window, width=332, height=352, fg_color="#FFFFFF", corner_radius=18
         )
         qr_frame.pack(pady=24)
         qr_frame.pack_propagate(False)
@@ -601,7 +630,10 @@ class DesktopApp:
         if QR_PATH.exists():
             QR_PATH.unlink()
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             context = await browser.new_context(locale="zh-CN")
             page = await context.new_page()
             await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=60_000)
@@ -621,25 +653,39 @@ class DesktopApp:
 
             qr = None
             selectors = [
-                '[class*="qrcode"] img',
-                '[class*="qr-code"] img',
+                '[class*="qrcode"]',
+                '[class*="qr-code"]',
+                '[class*="QRCode"]',
+                '[class*="qrCode"]',
+                '[data-e2e*="qr"]',
+                'img[src*="qr"]',
                 '[class*="login"] canvas',
-                '[class*="qrcode"] canvas',
+                '[class*="login"] svg',
                 'canvas',
             ]
-            for _ in range(20):
-                for selector in selectors:
-                    candidate = page.locator(selector)
-                    if await candidate.count():
-                        for index in range(min(await candidate.count(), 4)):
+            for _ in range(60):
+                for frame in page.frames:
+                    for selector in selectors:
+                        candidate = frame.locator(selector)
+                        try:
+                            count = min(await candidate.count(), 8)
+                        except Exception:
+                            continue
+                        for index in range(count):
                             item = candidate.nth(index)
                             try:
                                 box = await item.bounding_box()
-                                if box and box["width"] >= 120 and box["height"] >= 120:
+                                if not box:
+                                    continue
+                                width, height = box["width"], box["height"]
+                                ratio = width / max(1, height)
+                                if 130 <= width <= 430 and 130 <= height <= 430 and 0.72 <= ratio <= 1.38:
                                     qr = item
                                     break
                             except Exception:
                                 continue
+                        if qr is not None:
+                            break
                     if qr is not None:
                         break
                 if qr is not None:
@@ -647,8 +693,37 @@ class DesktopApp:
                 await page.wait_for_timeout(500)
 
             if qr is None:
+                fallback_selectors = [
+                    '[role="dialog"]',
+                    '[class*="login-panel"]',
+                    '[class*="loginPanel"]',
+                    '[class*="login-container"]',
+                    '[class*="loginContainer"]',
+                ]
+                for frame in page.frames:
+                    for selector in fallback_selectors:
+                        candidates = frame.locator(selector)
+                        try:
+                            count = min(await candidates.count(), 6)
+                        except Exception:
+                            continue
+                        for index in range(count):
+                            item = candidates.nth(index)
+                            try:
+                                box = await item.bounding_box()
+                                if box and 220 <= box["width"] <= 700 and 220 <= box["height"] <= 750:
+                                    qr = item
+                                    break
+                            except Exception:
+                                continue
+                        if qr is not None:
+                            break
+                    if qr is not None:
+                        break
+
+            if qr is None:
                 await browser.close()
-                raise RuntimeError("暂时没有获取到登录二维码，请稍后重试。")
+                raise RuntimeError("没有识别到二维码，请确认网络正常后重试。")
 
             await qr.screenshot(path=str(QR_PATH))
             self.root.after(0, self._show_qr_image)
@@ -676,7 +751,10 @@ class DesktopApp:
         if not self.qr_label or not QR_PATH.exists():
             return
         image = Image.open(QR_PATH).convert("RGB")
-        self.qr_image = ctk.CTkImage(light_image=image, dark_image=image, size=(248, 248))
+        image.thumbnail((300, 320), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (300, 320), "#FFFFFF")
+        canvas.paste(image, ((300 - image.width) // 2, (320 - image.height) // 2))
+        self.qr_image = ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(300, 320))
         self.qr_label.configure(image=self.qr_image, text="")
 
     def _login_success(self):
