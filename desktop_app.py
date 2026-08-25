@@ -82,6 +82,7 @@ class DesktopApp:
         self.accounts: list[dict] = []
         self.current_account_id = ""
         self.pending_new_account = False
+        self.qr_cancel_event = threading.Event()
 
         self._prepare_runtime()
         self._build_ui()
@@ -552,6 +553,7 @@ class DesktopApp:
     def start_qr_login(self):
         if self.busy:
             return
+        self.qr_cancel_event.clear()
         self._open_qr_window()
         self._set_busy(True, "获取二维码")
         threading.Thread(target=self._qr_login_worker, daemon=True).start()
@@ -566,7 +568,7 @@ class DesktopApp:
         window.resizable(False, False)
         window.configure(fg_color=CANVAS)
         window.transient(self.root)
-        window.grab_set()
+        window.protocol("WM_DELETE_WINDOW", self._cancel_login)
 
         ctk.CTkLabel(
             window,
@@ -614,15 +616,19 @@ class DesktopApp:
 
     def _cancel_login(self):
         self.pending_new_account = False
+        self.qr_cancel_event.set()
         if self.login_window and self.login_window.winfo_exists():
             self.login_window.destroy()
+        self.activity_text.configure(text="已取消扫码登录")
+        self._set_busy(False, "空闲")
 
     def _qr_login_worker(self):
         try:
             asyncio.run(self._qr_login())
             self.root.after(0, self._login_success)
         except Exception as exc:
-            self.root.after(0, lambda: self._login_error(str(exc)))
+            if str(exc) != "登录已取消":
+                self.root.after(0, lambda: self._login_error(str(exc)))
         finally:
             self._set_busy(False, "空闲")
 
@@ -631,12 +637,13 @@ class DesktopApp:
             QR_PATH.unlink()
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
-                headless=True,
+                headless=False,
                 args=["--disable-blink-features=AutomationControlled"],
             )
             context = await browser.new_context(locale="zh-CN")
             page = await context.new_page()
             await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=60_000)
+            await page.bring_to_front()
 
             login = page.get_by_text("登录", exact=True)
             if await login.count():
@@ -663,7 +670,10 @@ class DesktopApp:
                 '[class*="login"] svg',
                 'canvas',
             ]
-            for _ in range(60):
+            for _ in range(20):
+                if self.qr_cancel_event.is_set():
+                    await browser.close()
+                    raise RuntimeError("登录已取消")
                 for frame in page.frames:
                     for selector in selectors:
                         candidate = frame.locator(selector)
@@ -721,15 +731,21 @@ class DesktopApp:
                     if qr is not None:
                         break
 
-            if qr is None:
-                await browser.close()
-                raise RuntimeError("没有识别到二维码，请确认网络正常后重试。")
-
-            await qr.screenshot(path=str(QR_PATH))
-            self.root.after(0, self._show_qr_image)
+            if qr is not None:
+                await qr.screenshot(path=str(QR_PATH))
+                self.root.after(0, self._show_qr_image)
+            else:
+                self.root.after(
+                    0,
+                    lambda: self._show_browser_login_hint()
+                )
+                await page.bring_to_front()
 
             deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
+                if self.qr_cancel_event.is_set():
+                    await browser.close()
+                    raise RuntimeError("登录已取消")
                 cookies = await context.cookies()
                 authenticated = any(
                     cookie.get("name") in {"sessionid", "sessionid_ss", "sid_guard"}
@@ -746,6 +762,15 @@ class DesktopApp:
 
             await browser.close()
             raise RuntimeError("二维码已过期，请重新扫码。")
+
+    def _show_browser_login_hint(self):
+        if self.qr_label and self.qr_label.winfo_exists():
+            self.qr_label.configure(
+                text="抖音未允许内嵌二维码\n\n请在自动打开的抖音安全登录窗口中扫码",
+                image=None,
+                text_color=INK,
+            )
+        self.activity_text.configure(text="请在抖音安全登录窗口完成扫码")
 
     def _show_qr_image(self):
         if not self.qr_label or not QR_PATH.exists():
