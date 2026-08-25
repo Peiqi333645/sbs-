@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from io import BytesIO
 
 import customtkinter as ctk
 from PIL import Image
@@ -690,9 +691,14 @@ class DesktopApp:
                         + (f"：{last_error[:80]}" if last_error else "，请稍后重试")
                     )
 
-                encoded = qr_value.split(",", 1)[-1] if "base64," in qr_value else qr_value
+                encoded = (
+                    qr_value.split(",", 1)[-1] if "base64," in qr_value else qr_value
+                ).strip()
+                encoded += "=" * (-len(encoded) % 4)
                 try:
-                    qr_bytes = base64.b64decode(encoded)
+                    qr_bytes = base64.b64decode(encoded, validate=False)
+                    with Image.open(BytesIO(qr_bytes)) as qr_image:
+                        qr_image.verify()
                 except Exception as exc:
                     raise RuntimeError("抖音返回的二维码格式无效") from exc
                 if len(qr_bytes) < 100:
