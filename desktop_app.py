@@ -193,7 +193,7 @@ class DesktopApp:
         self.account_menu.pack(side="left", pady=8)
         ctk.CTkButton(
             account_row, text="＋ 添加账号", width=96, height=34, corner_radius=10,
-            fg_color=INK, hover_color="#333333", text_color="#FFFFFF",
+            fg_color="#FFF4CC", hover_color="#FFE79A", text_color="#7A5600",
             command=self.add_account
         ).pack(side="right", padx=8, pady=8)
 
@@ -260,7 +260,7 @@ class DesktopApp:
         )
         self.target_status_frame.pack(fill="x", padx=22, pady=(0, 18))
 
-        message_card = self._card(body, 1, 0, "03", "发送内容", "可指定固定文案，也可从多条文案中随机选择")
+        message_card = self._card(body, 1, 0, "03", "发送内容", "默认发送第一条，也可从多条内容中随机选择")
         self.messages = ctk.CTkTextbox(
             message_card,
             height=124,
@@ -277,25 +277,56 @@ class DesktopApp:
         ctk.CTkLabel(
             mode_row, text="发送方式", text_color=MUTED, font=ctk.CTkFont(size=11)
         ).pack(side="left")
-        self.message_mode = ctk.StringVar(value="随机内容")
+        self.message_mode = ctk.StringVar(value="默认第一条")
         ctk.CTkSegmentedButton(
-            mode_row, values=["指定内容", "随机内容"], variable=self.message_mode,
-            selected_color=GREEN, selected_hover_color="#198653",
+            mode_row, values=["默认第一条", "随机内容"], variable=self.message_mode,
+            selected_color=YELLOW, selected_hover_color=YELLOW_HOVER,
             unselected_color="#FFFFFF", unselected_hover_color="#F3F3F0",
             text_color=INK, corner_radius=10, border_width=1, fg_color=BORDER
         ).pack(side="right")
 
-        schedule_card = self._card(body, 1, 1, "04", "智能计划", "自动分散到白天和晚间，不再设置固定时间")
-        plan_box = ctk.CTkFrame(schedule_card, fg_color="#FAFAF8", corner_radius=14)
-        plan_box.pack(fill="x", padx=22, pady=(5, 12))
+        schedule_card = self._card(body, 1, 1, "04", "智能计划", "选择随机分散时间，或指定每天固定开始时间")
+        plan_mode_row = ctk.CTkFrame(schedule_card, fg_color="transparent")
+        plan_mode_row.pack(fill="x", padx=22, pady=(5, 10))
         ctk.CTkLabel(
+            plan_mode_row, text="时间方式", text_color=MUTED, font=ctk.CTkFont(size=11)
+        ).pack(side="left")
+        self.plan_mode = ctk.StringVar(value="随机时间")
+        self.plan_mode_control = ctk.CTkSegmentedButton(
+            plan_mode_row, values=["随机时间", "固定时间"], variable=self.plan_mode,
+            selected_color=YELLOW, selected_hover_color=YELLOW_HOVER,
+            unselected_color="#FFFFFF", unselected_hover_color="#F3F3F0",
+            text_color=INK, corner_radius=10, border_width=1, fg_color=BORDER,
+            command=self._plan_mode_changed
+        )
+        self.plan_mode_control.pack(side="right")
+
+        plan_box = ctk.CTkFrame(schedule_card, fg_color="#FAFAF8", corner_radius=14)
+        plan_box.pack(fill="x", padx=22, pady=(0, 12))
+        self.plan_title = ctk.CTkLabel(
             plan_box, text="每天自动生成分散时间", text_color=INK,
             font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(anchor="w", padx=16, pady=(14, 2))
-        ctk.CTkLabel(
-            plan_box, text="09:30–21:30 随机安排，每位好友单独执行",
+        )
+        self.plan_title.pack(anchor="w", padx=16, pady=(14, 2))
+        self.plan_description = ctk.CTkLabel(
+            plan_box, text="09:30–21:30 分段安排，每位好友单独执行",
             text_color=MUTED, font=ctk.CTkFont(size=11)
-        ).pack(anchor="w", padx=16, pady=(0, 14))
+        )
+        self.plan_description.pack(anchor="w", padx=16, pady=(0, 10))
+        fixed_row = ctk.CTkFrame(plan_box, fg_color="transparent")
+        fixed_row.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkLabel(
+            fixed_row, text="固定开始时间", text_color=MUTED, font=ctk.CTkFont(size=11)
+        ).pack(side="left")
+        self.fixed_time = ctk.StringVar(value="21:00")
+        self.fixed_time_entry = ctk.CTkEntry(
+            fixed_row, textvariable=self.fixed_time, width=84, height=34,
+            corner_radius=10, border_color=BORDER, fg_color="#FFFFFF",
+            justify="center", font=ctk.CTkFont(size=13, weight="bold"),
+            state="disabled"
+        )
+        self.fixed_time_entry.pack(side="right")
+
         switch_row = ctk.CTkFrame(schedule_card, fg_color="transparent")
         switch_row.pack(fill="x", padx=24, pady=(2, 20))
         ctk.CTkLabel(
@@ -305,7 +336,7 @@ class DesktopApp:
         self.schedule_enabled = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(
             switch_row, text="", variable=self.schedule_enabled, width=44,
-            progress_color=GREEN, button_color="#FFFFFF",
+            progress_color=YELLOW, button_color="#FFFFFF",
             command=self._schedule_switch_changed
         ).pack(side="right")
 
@@ -342,9 +373,9 @@ class DesktopApp:
             width=108,
             height=44,
             corner_radius=13,
-            fg_color="#242424",
-            hover_color="#383838",
-            text_color="#FFFFFF",
+            fg_color="#FFF4CC",
+            hover_color="#FFE79A",
+            text_color="#7A5600",
             font=ctk.CTkFont(size=13, weight="bold"),
             command=lambda: self.start_run(True),
         )
@@ -414,9 +445,16 @@ class DesktopApp:
             try:
                 data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
                 self.schedule_enabled.set(bool(data.get("schedule_enabled", False)))
-                saved_mode = data.get("message_mode", "随机内容")
-                legacy_modes = {"固定第一条": "指定内容", "随机选择": "随机内容"}
+                saved_mode = data.get("message_mode", "默认第一条")
+                legacy_modes = {
+                    "固定第一条": "默认第一条",
+                    "指定内容": "默认第一条",
+                    "随机选择": "随机内容",
+                }
                 self.message_mode.set(legacy_modes.get(saved_mode, saved_mode))
+                self.plan_mode.set(data.get("plan_mode", "随机时间"))
+                self.fixed_time.set(data.get("fixed_time", "21:00"))
+                self._plan_mode_changed(self.plan_mode.get(), save=False)
                 self._load_daily_plan()
             except Exception:
                 pass
@@ -432,12 +470,19 @@ class DesktopApp:
             messages = list(RANDOM_MESSAGES)
         if not messages:
             if not silent:
-                messagebox.showwarning(APP_NAME, "指定内容模式需要至少填写一条内容。")
+                messagebox.showwarning(APP_NAME, "默认第一条模式需要至少填写一条内容。")
             return False
         if len(friends) > 10:
             if not silent:
                 messagebox.showwarning(APP_NAME, "为降低账号风险，第一版最多设置 10 位互动对象。")
             return False
+        if self.plan_mode.get() == "固定时间":
+            try:
+                datetime.strptime(self.fixed_time.get().strip(), "%H:%M")
+            except ValueError:
+                if not silent:
+                    messagebox.showwarning(APP_NAME, "固定时间请使用 24 小时格式，例如 21:00。")
+                return False
         config = dict(DEFAULT_CONFIG)
         config["friends"] = friends
         config["messages"] = [{"type": "text", "value": text} for text in messages]
@@ -447,6 +492,8 @@ class DesktopApp:
                 {
                     "schedule_enabled": self.schedule_enabled.get(),
                     "message_mode": self.message_mode.get(),
+                    "plan_mode": self.plan_mode.get(),
+                    "fixed_time": self.fixed_time.get().strip(),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -792,6 +839,19 @@ class DesktopApp:
         finally:
             self._set_busy(False, "空闲")
 
+    def _plan_mode_changed(self, selected: str, save: bool = True):
+        fixed = selected == "固定时间"
+        self.fixed_time_entry.configure(state="normal" if fixed else "disabled")
+        self.plan_title.configure(text="每天按固定时间开始" if fixed else "每天自动生成分散时间")
+        self.plan_description.configure(
+            text="从设定时间开始，好友之间仍保留自然间隔"
+            if fixed else "09:30–21:30 分段安排，每位好友单独执行"
+        )
+        if save and hasattr(self, "schedule_enabled"):
+            self._ensure_daily_plan(force=True)
+            self._save_settings_only()
+            self._render_target_status()
+
     def _schedule_switch_changed(self):
         if self.schedule_enabled.get():
             if not STATE_PATH.exists():
@@ -813,6 +873,8 @@ class DesktopApp:
         SETTINGS_PATH.write_text(json.dumps({
             "schedule_enabled": self.schedule_enabled.get(),
             "message_mode": self.message_mode.get(),
+            "plan_mode": self.plan_mode.get(),
+            "fixed_time": self.fixed_time.get().strip(),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _load_daily_plan(self):
@@ -834,18 +896,29 @@ class DesktopApp:
         if not force and self.daily_plan and existing_names == friends:
             return
         now = datetime.now()
-        start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        end = now.replace(hour=21, minute=30, second=0, microsecond=0)
-        if now > start:
-            start = now + timedelta(minutes=5)
-        if start >= end:
-            start = now + timedelta(minutes=2)
-            end = now + timedelta(hours=2)
-        span = max(1, int((end - start).total_seconds()))
-        count = len(friends)
-        bucket = span / max(1, count)
-        slots = [min(span - 1, int(i * bucket + random.uniform(bucket * 0.18, bucket * 0.82)))
-                 for i in range(count)]
+        if self.plan_mode.get() == "固定时间":
+            fixed = datetime.strptime(self.fixed_time.get().strip(), "%H:%M")
+            start = now.replace(hour=fixed.hour, minute=fixed.minute, second=0, microsecond=0)
+            if start <= now:
+                start += timedelta(days=1)
+            slots = []
+            cursor = 0
+            for _ in friends:
+                slots.append(cursor)
+                cursor += random.randint(120, 300)
+        else:
+            start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            end = now.replace(hour=21, minute=30, second=0, microsecond=0)
+            if now > start:
+                start = now + timedelta(minutes=5)
+            if start >= end:
+                start = now + timedelta(minutes=2)
+                end = now + timedelta(hours=2)
+            span = max(1, int((end - start).total_seconds()))
+            count = len(friends)
+            bucket = span / max(1, count)
+            slots = [min(span - 1, int(i * bucket + random.uniform(bucket * 0.18, bucket * 0.82)))
+                     for i in range(count)]
         self.daily_plan = [{
             "friend": friend,
             "time": (start + timedelta(seconds=slots[i])).isoformat(timespec="seconds"),
@@ -931,7 +1004,7 @@ class DesktopApp:
             all_messages = config.get("messages", [])
             if not all_messages:
                 raise RuntimeError("没有可发送的内容")
-            selected = all_messages[0] if self.message_mode.get() == "指定内容" else random.choice(all_messages)
+            selected = all_messages[0] if self.message_mode.get() == "默认第一条" else random.choice(all_messages)
             config["friends"] = [item["friend"]]
             config["messages"] = [selected]
             CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
