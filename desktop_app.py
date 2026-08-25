@@ -628,7 +628,7 @@ class DesktopApp:
             self.root.after(0, self._login_success)
         except Exception as exc:
             if str(exc) != "登录已取消":
-                self.root.after(0, lambda: self._login_error(str(exc)))
+                self.root.after(0, lambda error=str(exc): self._login_error(error))
         finally:
             self._set_busy(False, "空闲")
 
