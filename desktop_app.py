@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import platform
@@ -635,142 +636,129 @@ class DesktopApp:
     async def _qr_login(self):
         if QR_PATH.exists():
             QR_PATH.unlink()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.douyin.com/",
+            "Origin": "https://www.douyin.com",
+        }
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
+            request = await playwright.request.new_context(
+                extra_http_headers=headers,
+                ignore_https_errors=False,
             )
-            context = await browser.new_context(locale="zh-CN")
-            page = await context.new_page()
-            await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=60_000)
-            await page.bring_to_front()
-
-            login = page.get_by_text("登录", exact=True)
-            if await login.count():
-                try:
-                    await login.first.click(timeout=8_000)
-                except Exception:
-                    pass
-            qr_tab = page.get_by_text("扫码登录", exact=True)
-            if await qr_tab.count():
-                try:
-                    await qr_tab.first.click(timeout=5_000)
-                except Exception:
-                    pass
-
-            qr = None
-            selectors = [
-                '[class*="qrcode"]',
-                '[class*="qr-code"]',
-                '[class*="QRCode"]',
-                '[class*="qrCode"]',
-                '[data-e2e*="qr"]',
-                'img[src*="qr"]',
-                '[class*="login"] canvas',
-                '[class*="login"] svg',
-                'canvas',
-            ]
-            for _ in range(20):
-                if self.qr_cancel_event.is_set():
-                    await browser.close()
-                    raise RuntimeError("登录已取消")
-                for frame in page.frames:
-                    for selector in selectors:
-                        candidate = frame.locator(selector)
-                        try:
-                            count = min(await candidate.count(), 8)
-                        except Exception:
-                            continue
-                        for index in range(count):
-                            item = candidate.nth(index)
-                            try:
-                                box = await item.bounding_box()
-                                if not box:
-                                    continue
-                                width, height = box["width"], box["height"]
-                                ratio = width / max(1, height)
-                                if 130 <= width <= 430 and 130 <= height <= 430 and 0.72 <= ratio <= 1.38:
-                                    qr = item
-                                    break
-                            except Exception:
-                                continue
-                        if qr is not None:
-                            break
-                    if qr is not None:
-                        break
-                if qr is not None:
-                    break
-                await page.wait_for_timeout(500)
-
-            if qr is None:
-                fallback_selectors = [
-                    '[role="dialog"]',
-                    '[class*="login-panel"]',
-                    '[class*="loginPanel"]',
-                    '[class*="login-container"]',
-                    '[class*="loginContainer"]',
+            try:
+                token = ""
+                qr_value = ""
+                api_mode = ""
+                get_endpoints = [
+                    (
+                        "passport",
+                        "https://login.douyin.com/passport/web/get_qrcode/"
+                        "?aid=6383&language=zh&is_new_login=1&need_logo=false",
+                    ),
+                    (
+                        "sso",
+                        "https://sso.douyin.com/get_qrcode/"
+                        "?aid=6383&service=https%3A%2F%2Fwww.douyin.com"
+                        "&next=https%3A%2F%2Fwww.douyin.com%2F",
+                    ),
                 ]
-                for frame in page.frames:
-                    for selector in fallback_selectors:
-                        candidates = frame.locator(selector)
-                        try:
-                            count = min(await candidates.count(), 6)
-                        except Exception:
-                            continue
-                        for index in range(count):
-                            item = candidates.nth(index)
-                            try:
-                                box = await item.bounding_box()
-                                if box and 220 <= box["width"] <= 700 and 220 <= box["height"] <= 750:
-                                    qr = item
-                                    break
-                            except Exception:
-                                continue
-                        if qr is not None:
+                last_error = ""
+                for mode, endpoint in get_endpoints:
+                    if self.qr_cancel_event.is_set():
+                        raise RuntimeError("登录已取消")
+                    try:
+                        response = await request.get(endpoint, timeout=30_000)
+                        payload = await response.json()
+                        data = payload.get("data") or {}
+                        token = str(data.get("token") or "")
+                        qr_value = str(data.get("qrcode") or data.get("qr_code") or "")
+                        if token and qr_value:
+                            api_mode = mode
                             break
-                    if qr is not None:
-                        break
+                        last_error = str(payload.get("message") or payload.get("description") or "")
+                    except Exception as exc:
+                        last_error = str(exc)
 
-            if qr is not None:
-                await qr.screenshot(path=str(QR_PATH))
+                if not token or not qr_value:
+                    raise RuntimeError(
+                        "抖音没有返回登录二维码"
+                        + (f"：{last_error[:80]}" if last_error else "，请稍后重试")
+                    )
+
+                encoded = qr_value.split(",", 1)[-1] if "base64," in qr_value else qr_value
+                try:
+                    qr_bytes = base64.b64decode(encoded)
+                except Exception as exc:
+                    raise RuntimeError("抖音返回的二维码格式无效") from exc
+                if len(qr_bytes) < 100:
+                    raise RuntimeError("抖音返回的二维码内容为空")
+                QR_PATH.write_bytes(qr_bytes)
                 self.root.after(0, self._show_qr_image)
-            else:
-                self.root.after(
-                    0,
-                    lambda: self._show_browser_login_hint()
-                )
-                await page.bring_to_front()
 
-            deadline = time.monotonic() + 180
-            while time.monotonic() < deadline:
-                if self.qr_cancel_event.is_set():
-                    await browser.close()
-                    raise RuntimeError("登录已取消")
-                cookies = await context.cookies()
-                authenticated = any(
-                    cookie.get("name") in {"sessionid", "sessionid_ss", "sid_guard"}
-                    and cookie.get("value")
-                    for cookie in cookies
-                )
-                if authenticated:
-                    tmp = STATE_PATH.with_suffix(".tmp")
-                    await context.storage_state(path=str(tmp))
-                    tmp.replace(STATE_PATH)
-                    await browser.close()
-                    return
-                await page.wait_for_timeout(1500)
+                deadline = time.monotonic() + 180
+                while time.monotonic() < deadline:
+                    if self.qr_cancel_event.is_set():
+                        raise RuntimeError("登录已取消")
+                    if api_mode == "passport":
+                        check_url = (
+                            "https://login.douyin.com/passport/web/check_qrconnect/"
+                            f"?aid=6383&token={token}"
+                        )
+                        response = await request.post(
+                            check_url,
+                            form={
+                                "need_logo": "false",
+                                "is_frontier": "true",
+                                "token": token,
+                                "is_new_login": "1",
+                                "next": "https://www.douyin.com/",
+                                "need_short_url": "true",
+                            },
+                            timeout=20_000,
+                        )
+                    else:
+                        check_url = (
+                            "https://sso.douyin.com/check_qrconnect/"
+                            f"?aid=6383&token={token}"
+                            "&service=https%3A%2F%2Fwww.douyin.com"
+                            "&next=https%3A%2F%2Fwww.douyin.com%2F"
+                        )
+                        response = await request.get(check_url, timeout=20_000)
 
-            await browser.close()
-            raise RuntimeError("二维码已过期，请重新扫码。")
+                    payload = await response.json()
+                    data = payload.get("data") or {}
+                    try:
+                        status = int(data.get("status", 0))
+                    except (TypeError, ValueError):
+                        status = 0
+                    if status == 2:
+                        self.root.after(0, self._show_scanned_hint)
+                    elif status == 3:
+                        redirect_url = data.get("redirect_url") or data.get("redirectUrl")
+                        if redirect_url:
+                            await request.get(str(redirect_url), timeout=30_000)
+                        tmp = STATE_PATH.with_suffix(".tmp")
+                        await request.storage_state(path=str(tmp))
+                        tmp.replace(STATE_PATH)
+                        return
+                    elif status == 5:
+                        raise RuntimeError("二维码已过期，请重新获取")
+                    await asyncio.sleep(1.5)
+                raise RuntimeError("二维码已过期，请重新获取")
+            finally:
+                await request.dispose()
 
-    def _show_browser_login_hint(self):
+
+    def _show_scanned_hint(self):
         if self.qr_label and self.qr_label.winfo_exists():
-            self.qr_label.configure(
-                text="抖音未允许内嵌二维码\n\n请在自动打开的抖音安全登录窗口中扫码",
-                image=None,
-                text_color=INK,
-            )
-        self.activity_text.configure(text="请在抖音安全登录窗口完成扫码")
+            self.qr_label.configure(text="已扫码，请在手机上确认登录", text_color=GREEN)
+        self.activity_text.configure(text="已扫码，等待手机确认")
+
 
     def _show_qr_image(self):
         if not self.qr_label or not QR_PATH.exists():
