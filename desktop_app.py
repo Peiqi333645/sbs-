@@ -394,15 +394,19 @@ class DesktopApp:
         track = ctk.CTkFrame(parent, fg_color="#EFEFED", corner_radius=15, height=38)
         buttons = {}
 
-        def choose(value, notify=True):
-            variable.set(value)
+        def paint(*_):
+            current = variable.get()
             for item_value, button in buttons.items():
-                selected = item_value == value
+                selected = item_value == current
                 button.configure(
                     fg_color=YELLOW if selected else "transparent",
                     hover_color=YELLOW_HOVER if selected else "#E4E4DF",
                     text_color=INK if selected else MUTED,
                 )
+
+        def choose(value, notify=True):
+            variable.set(value)
+            paint()
             if notify and command:
                 command(value)
 
@@ -416,6 +420,7 @@ class DesktopApp:
             )
             button.pack(side="left", padx=(2 if index == 0 else 0, 2), pady=2)
             buttons[value] = button
+        variable.trace_add("write", paint)
         choose(variable.get(), notify=False)
         return track
 
