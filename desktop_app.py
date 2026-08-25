@@ -254,14 +254,13 @@ class DesktopApp:
             text_color=MUTED,
             font=ctk.CTkFont(size=11),
         ).pack(anchor="w", padx=24, pady=(0, 8))
-        self.target_status = ctk.CTkTextbox(
-            target_card, height=82, corner_radius=12, border_width=0,
-            fg_color="#FAFAF8", text_color=INK, font=ctk.CTkFont(size=12)
+        self.target_status_frame = ctk.CTkFrame(
+            target_card, fg_color="#FAFAF8", corner_radius=12,
+            border_width=1, border_color=BORDER
         )
-        self.target_status.pack(fill="x", padx=22, pady=(0, 18))
-        self.target_status.configure(state="disabled")
+        self.target_status_frame.pack(fill="x", padx=22, pady=(0, 18))
 
-        message_card = self._card(body, 1, 0, "03", "发送内容", "每天随机选择一条，不需要编辑配置文件")
+        message_card = self._card(body, 1, 0, "03", "发送内容", "可指定固定文案，也可从多条文案中随机选择")
         self.messages = ctk.CTkTextbox(
             message_card,
             height=124,
@@ -278,12 +277,12 @@ class DesktopApp:
         ctk.CTkLabel(
             mode_row, text="发送方式", text_color=MUTED, font=ctk.CTkFont(size=11)
         ).pack(side="left")
-        self.message_mode = ctk.StringVar(value="随机选择")
+        self.message_mode = ctk.StringVar(value="随机内容")
         ctk.CTkSegmentedButton(
-            mode_row, values=["固定第一条", "随机选择"], variable=self.message_mode,
-            selected_color=INK, selected_hover_color="#303030",
-            unselected_color="#EFEFED", unselected_hover_color="#E2E2DE",
-            text_color=INK, corner_radius=10
+            mode_row, values=["指定内容", "随机内容"], variable=self.message_mode,
+            selected_color=GREEN, selected_hover_color="#198653",
+            unselected_color="#FFFFFF", unselected_hover_color="#F3F3F0",
+            text_color=INK, corner_radius=10, border_width=1, border_color=BORDER
         ).pack(side="right")
 
         schedule_card = self._card(body, 1, 1, "04", "智能计划", "自动分散到白天和晚间，不再设置固定时间")
@@ -415,7 +414,9 @@ class DesktopApp:
             try:
                 data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
                 self.schedule_enabled.set(bool(data.get("schedule_enabled", False)))
-                self.message_mode.set(data.get("message_mode", "随机选择"))
+                saved_mode = data.get("message_mode", "随机内容")
+                legacy_modes = {"固定第一条": "指定内容", "随机选择": "随机内容"}
+                self.message_mode.set(legacy_modes.get(saved_mode, saved_mode))
                 self._load_daily_plan()
             except Exception:
                 pass
@@ -427,11 +428,11 @@ class DesktopApp:
             if not silent:
                 messagebox.showwarning(APP_NAME, "请至少填写一位互动对象。")
             return False
-        if not messages and self.message_mode.get() == "随机选择":
+        if not messages and self.message_mode.get() == "随机内容":
             messages = list(RANDOM_MESSAGES)
         if not messages:
             if not silent:
-                messagebox.showwarning(APP_NAME, "固定发送模式需要至少填写一条内容。")
+                messagebox.showwarning(APP_NAME, "指定内容模式需要至少填写一条内容。")
             return False
         if len(friends) > 10:
             if not silent:
@@ -862,28 +863,46 @@ class DesktopApp:
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _render_target_status(self):
-        if not hasattr(self, "target_status"):
+        if not hasattr(self, "target_status_frame"):
             return
+        for widget in self.target_status_frame.winfo_children():
+            widget.destroy()
         friends = [line.strip() for line in self.friends.get("1.0", "end").splitlines() if line.strip()]
         by_name = {item.get("friend"): item for item in self.daily_plan}
-        lines = []
-        for friend in friends:
+        if not friends:
+            ctk.CTkLabel(
+                self.target_status_frame, text="添加好友后显示今日状态",
+                text_color=MUTED, font=ctk.CTkFont(size=12)
+            ).pack(anchor="w", padx=14, pady=14)
+            return
+        styles = {
+            "success": ("已完成", "#E8F7EF", "#147A49"),
+            "running": ("正在发送", "#FFF4CC", "#8A6300"),
+            "failed": ("已停止", "#FDECEC", "#B52E2E"),
+            "pending": ("未发送", "#FDECEC", "#B52E2E"),
+        }
+        for index, friend in enumerate(friends):
             item = by_name.get(friend, {})
             status = item.get("status", "pending")
+            label, badge_bg, badge_text = styles.get(status, styles["pending"])
             when = item.get("time", "")
             clock = datetime.fromisoformat(when).strftime("%H:%M") if when else "--:--"
-            if status == "success":
-                lines.append(f"🟢  {friend}  ·  已完成")
-            elif status == "running":
-                lines.append(f"🟡  {friend}  ·  正在发送")
-            elif status == "failed":
-                lines.append(f"🔴  {friend}  ·  已停止")
-            else:
-                lines.append(f"🔴  {friend}  ·  未发送  {clock}")
-        self.target_status.configure(state="normal")
-        self.target_status.delete("1.0", "end")
-        self.target_status.insert("1.0", "\n".join(lines) or "添加好友后显示今日状态")
-        self.target_status.configure(state="disabled")
+            row = ctk.CTkFrame(self.target_status_frame, fg_color="transparent", corner_radius=0)
+            row.pack(fill="x", padx=12, pady=(9 if index == 0 else 4, 9 if index == len(friends) - 1 else 4))
+            ctk.CTkLabel(
+                row, text=friend, text_color=INK, anchor="w",
+                font=ctk.CTkFont(size=12, weight="bold")
+            ).pack(side="left")
+            ctk.CTkLabel(
+                row, text=label, width=70, height=25, corner_radius=9,
+                fg_color=badge_bg, text_color=badge_text,
+                font=ctk.CTkFont(size=11, weight="bold")
+            ).pack(side="right")
+            if status == "pending":
+                ctk.CTkLabel(
+                    row, text=clock, text_color=MUTED, font=ctk.CTkFont(size=11)
+                ).pack(side="right", padx=(0, 8))
+
 
     def _scheduler_loop(self):
         while True:
@@ -912,7 +931,7 @@ class DesktopApp:
             all_messages = config.get("messages", [])
             if not all_messages:
                 raise RuntimeError("没有可发送的内容")
-            selected = all_messages[0] if self.message_mode.get() == "固定第一条" else random.choice(all_messages)
+            selected = all_messages[0] if self.message_mode.get() == "指定内容" else random.choice(all_messages)
             config["friends"] = [item["friend"]]
             config["messages"] = [selected]
             CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
