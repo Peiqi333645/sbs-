@@ -282,7 +282,7 @@ class DesktopApp:
             mode_row, values=["指定内容", "随机内容"], variable=self.message_mode,
             selected_color=GREEN, selected_hover_color="#198653",
             unselected_color="#FFFFFF", unselected_hover_color="#F3F3F0",
-            text_color=INK, corner_radius=10, border_width=1, border_color=BORDER
+            text_color=INK, corner_radius=10, border_width=1, fg_color=BORDER
         ).pack(side="right")
 
         schedule_card = self._card(body, 1, 1, "04", "智能计划", "自动分散到白天和晚间，不再设置固定时间")
@@ -995,9 +995,28 @@ class DesktopApp:
 
 
 def main():
-    root = ctk.CTk()
-    DesktopApp(root)
-    root.mainloop()
+    root = None
+    try:
+        root = ctk.CTk()
+        DesktopApp(root)
+        root.mainloop()
+    except Exception as exc:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        error_path = DATA_DIR / "startup-error.log"
+        error_path.write_text(
+            f"{datetime.now().isoformat()}\n{type(exc).__name__}: {exc}\n",
+            encoding="utf-8",
+        )
+        try:
+            if root is not None:
+                root.withdraw()
+            messagebox.showerror(
+                APP_NAME,
+                f"软件启动失败，错误信息已保存。\n\n{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
