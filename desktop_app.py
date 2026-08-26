@@ -94,6 +94,9 @@ class DesktopApp:
         self._refresh_login_state()
         self._render_target_status()
         threading.Thread(target=self._scheduler_loop, daemon=True).start()
+        threading.Thread(
+            target=self._account_name_backfill_worker, daemon=True
+        ).start()
 
     def _prepare_runtime(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -813,20 +816,10 @@ class DesktopApp:
                         "扫码确认后仍未完成登录，请在抖音 App 内完成验证后重试"
                     )
 
-                # 登录完成后读取公开昵称，用于多账号区分；失败不影响登录。
-                try:
-                    profile = await context.request.get(
-                        "https://www.douyin.com/aweme/v1/web/query/user/"
-                        "?device_platform=webapp&aid=6383"
-                        "&channel=channel_pc_web"
-                        "&publish_video_strategy_type=2",
-                        timeout=5_000,
-                    )
-                    self.pending_account_name = find_nickname(
-                        await read_payload(profile)
-                    )
-                except Exception:
-                    self.pending_account_name = ""
+                # 接口、页面内嵌数据和“我的”入口多路读取昵称。
+                self.pending_account_name = await self._resolve_profile_name(
+                    page, context
+                )
             finally:
                 await browser.close()
 
@@ -846,6 +839,140 @@ class DesktopApp:
         canvas.paste(image, ((300 - image.width) // 2, (320 - image.height) // 2))
         self.qr_image = ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(300, 320))
         self.qr_label.configure(image=self.qr_image, text="")
+
+    @staticmethod
+    def _find_profile_nickname(value):
+        if isinstance(value, dict):
+            nickname = value.get("nickname")
+            if isinstance(nickname, str) and nickname.strip():
+                return nickname.strip()
+            for child in value.values():
+                found = DesktopApp._find_profile_nickname(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = DesktopApp._find_profile_nickname(child)
+                if found:
+                    return found
+        return ""
+
+    async def _resolve_profile_name(self, page, context):
+        endpoints = [
+            (
+                "https://www.douyin.com/aweme/v1/web/query/user/"
+                "?device_platform=webapp&aid=6383"
+                "&channel=channel_pc_web&publish_video_strategy_type=2"
+            ),
+            (
+                "https://www.douyin.com/aweme/v1/web/get/user/settings"
+                "?device_platform=webapp&aid=6383"
+            ),
+        ]
+        for endpoint in endpoints:
+            try:
+                response = await context.request.get(endpoint, timeout=4_000)
+                text = (await response.text()).strip()
+                payload = json.loads(text) if text.startswith("{") else {}
+                nickname = self._find_profile_nickname(payload)
+                if nickname:
+                    return nickname
+            except Exception:
+                continue
+
+        # 抖音会把当前用户资料写入页面的 RENDER_DATA。这个路径不依赖
+        # 单独的用户资料接口，适合接口灰度或字段变化时兜底。
+        try:
+            await page.goto(
+                "https://www.douyin.com/",
+                wait_until="domcontentloaded",
+                timeout=12_000,
+            )
+            payload = await page.evaluate(
+                """() => {
+                    const node = document.querySelector('#RENDER_DATA');
+                    if (!node || !node.textContent) return {};
+                    const raw = node.textContent.trim();
+                    for (const text of [raw, decodeURIComponent(raw)]) {
+                        try { return JSON.parse(text); } catch (_) {}
+                    }
+                    return {};
+                }"""
+            )
+            nickname = self._find_profile_nickname(payload)
+            if nickname:
+                return nickname
+        except Exception:
+            pass
+
+        # 最后读取顶部“我的”入口附近的账号名称。
+        try:
+            candidates = await page.locator(
+                'a[href*="/user/"], [data-e2e*="user"]'
+            ).all_inner_texts()
+            ignored = {"我的", "用户", "个人主页", "登录"}
+            for text in candidates:
+                name = " ".join(text.split()).strip()
+                if name and name not in ignored and 1 < len(name) <= 40:
+                    return name
+        except Exception:
+            pass
+        return ""
+
+    def _account_name_backfill_worker(self):
+        generic = [
+            item for item in self.accounts
+            if item.get("name", "").startswith("账号 ")
+            and (ACCOUNTS_DIR / f"{item.get('id', '')}.json").exists()
+        ]
+        if not generic:
+            return
+        try:
+            asyncio.run(self._backfill_account_names(generic))
+        except Exception:
+            return
+
+    async def _backfill_account_names(self, accounts):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            changed = False
+            try:
+                for account in accounts:
+                    state_path = ACCOUNTS_DIR / f"{account['id']}.json"
+                    context = await browser.new_context(
+                        storage_state=str(state_path),
+                        locale="zh-CN",
+                        viewport={"width": 1100, "height": 720},
+                    )
+                    try:
+                        page = await context.new_page()
+                        nickname = await self._resolve_profile_name(page, context)
+                        if nickname:
+                            used = {
+                                item["name"] for item in self.accounts
+                                if item["id"] != account["id"]
+                            }
+                            display_name = nickname
+                            suffix = 2
+                            while display_name in used:
+                                display_name = f"{nickname} ({suffix})"
+                                suffix += 1
+                            account["name"] = display_name
+                            changed = True
+                    finally:
+                        await context.close()
+            finally:
+                await browser.close()
+            if changed:
+                self._save_account_registry()
+                self.root.after(0, self._refresh_account_menu)
+                self.root.after(
+                    0,
+                    lambda: self.activity_text.configure(
+                        text="已同步抖音账号名称"
+                    ),
+                )
+
 
     def _login_success(self):
         nickname = self.pending_account_name.strip()
