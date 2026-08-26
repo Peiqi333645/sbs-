@@ -84,6 +84,7 @@ class DesktopApp:
         self.accounts: list[dict] = []
         self.current_account_id = ""
         self.pending_new_account = False
+        self.pending_account_name = ""
         self.qr_cancel_event = threading.Event()
 
         self._prepare_runtime()
@@ -637,6 +638,7 @@ class DesktopApp:
     async def _qr_login(self):
         if QR_PATH.exists():
             QR_PATH.unlink()
+        self.pending_account_name = ""
 
         headers = {
             "User-Agent": (
@@ -644,72 +646,65 @@ class DesktopApp:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9",
-            "Referer": "https://www.douyin.com/",
-            "Origin": "https://www.douyin.com",
         }
 
         async def read_payload(response):
             text = (await response.text()).strip()
             if not text:
-                raise RuntimeError(
-                    f"接口返回空内容（HTTP {response.status}）"
-                )
+                return {}
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
-                # 部分节点可能返回 JSONP，提取其中的 JSON 对象。
-                first = text.find("{")
-                last = text.rfind("}")
+                first, last = text.find("{"), text.rfind("}")
                 if first >= 0 and last > first:
                     try:
                         return json.loads(text[first:last + 1])
                     except json.JSONDecodeError:
                         pass
-                content_type = response.headers.get("content-type", "")
-                raise RuntimeError(
-                    f"接口返回的不是登录数据（HTTP {response.status}，"
-                    f"{content_type or '未知类型'}）"
-                )
+                return {}
+
+        def find_nickname(value):
+            if isinstance(value, dict):
+                nickname = value.get("nickname")
+                if isinstance(nickname, str) and nickname.strip():
+                    return nickname.strip()
+                for child in value.values():
+                    found = find_nickname(child)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = find_nickname(child)
+                    if found:
+                        return found
+            return ""
 
         async with async_playwright() as playwright:
-            request = await playwright.request.new_context(
-                extra_http_headers=headers,
-                ignore_https_errors=False,
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(
+                locale="zh-CN",
+                user_agent=headers["User-Agent"],
+                viewport={"width": 1280, "height": 800},
             )
-            browser = None
-            browser_context = None
-            page = None
-            poll_request = request
-            save_browser_state = False
             try:
-                token = ""
-                qr_value = ""
-                api_mode = ""
-                last_error = ""
-                get_endpoints = [
-                    (
-                        "passport",
-                        "https://login.douyin.com/passport/web/get_qrcode/"
-                        "?aid=6383&language=zh&is_new_login=1&need_logo=false"
-                        "&service=https%3A%2F%2Fwww.douyin.com"
-                        "&next=https%3A%2F%2Fwww.douyin.com%2F",
-                    ),
-                    (
-                        "sso",
-                        "https://sso.douyin.com/get_qrcode/"
-                        "?aid=6383&language=zh&is_new_login=1&need_logo=false"
-                        "&service=https%3A%2F%2Fwww.douyin.com"
-                        "&next=https%3A%2F%2Fwww.douyin.com%2F",
-                    ),
-                ]
+                # 跳过视频、字体和普通图片，保留 JS 与登录接口，显著缩短冷启动。
+                async def route_fast(route):
+                    resource_type = route.request.resource_type
+                    if resource_type in {"media", "font", "image"}:
+                        await route.abort()
+                    else:
+                        await route.continue_()
 
-                for mode, endpoint in get_endpoints:
-                    if self.qr_cancel_event.is_set():
-                        raise RuntimeError("登录已取消")
-                    try:
-                        response = await request.get(endpoint, timeout=6_000)
+                await context.route("**/*", route_fast)
+                page = await context.new_page()
+                loop = asyncio.get_running_loop()
+                qr_future = loop.create_future()
+                confirmed_future = loop.create_future()
+
+                async def capture_login(response):
+                    url = response.url
+                    if "get_qrcode" in url and not qr_future.done():
                         payload = await read_payload(response)
                         data = payload.get("data") or {}
                         token = str(data.get("token") or "")
@@ -717,80 +712,50 @@ class DesktopApp:
                             data.get("qrcode") or data.get("qr_code") or ""
                         )
                         if token and qr_value:
-                            api_mode = mode
-                            break
-                        last_error = str(
-                            payload.get("message")
-                            or payload.get("description")
-                            or "接口没有二维码字段"
-                        )
-                    except Exception as exc:
-                        last_error = str(exc)
-
-                # 某些网络节点会拦截直接 API。此时在后台隐藏浏览器中
-                # 让抖音网页自己完成安全参数生成，再截获二维码响应。
-                if not token or not qr_value:
-                    self.root.after(
-                        0,
-                        lambda: self.activity_text.configure(
-                            text="正在通过安全通道获取二维码"
-                        ),
-                    )
-                    browser = await playwright.chromium.launch(headless=True)
-                    browser_context = await browser.new_context(
-                        locale="zh-CN",
-                        user_agent=headers["User-Agent"],
-                    )
-                    page = await browser_context.new_page()
-                    loop = asyncio.get_running_loop()
-                    qr_future = loop.create_future()
-
-                    async def capture_qr(response):
-                        if "get_qrcode" not in response.url or qr_future.done():
-                            return
+                            qr_future.set_result(qr_value)
+                        return
+                    if "check_qrconnect" in url:
+                        payload = await read_payload(response)
+                        data = payload.get("data") or {}
                         try:
-                            payload = await read_payload(response)
-                            data = payload.get("data") or {}
-                            found_token = str(data.get("token") or "")
-                            found_qr = str(
-                                data.get("qrcode") or data.get("qr_code") or ""
+                            status = int(data.get("status", 0))
+                        except (TypeError, ValueError):
+                            status = 0
+                        if status == 2:
+                            self.root.after(0, self._show_scanned_hint)
+                        elif status == 3 and not confirmed_future.done():
+                            confirmed_future.set_result(
+                                data.get("redirect_url")
+                                or data.get("redirectUrl")
+                                or ""
                             )
-                            if found_token and found_qr:
-                                mode = (
-                                    "passport"
-                                    if "passport/web" in response.url
-                                    else "sso"
-                                )
-                                qr_future.set_result((mode, found_token, found_qr))
-                        except Exception:
-                            pass
+                        elif status == 5 and not confirmed_future.done():
+                            confirmed_future.set_exception(
+                                RuntimeError("二维码已过期，请重新获取")
+                            )
 
-                    page.on(
-                        "response",
-                        lambda response: asyncio.create_task(capture_qr(response)),
-                    )
-                    await page.goto(
-                        "https://www.douyin.com/",
-                        wait_until="domcontentloaded",
-                        timeout=60_000,
-                    )
-                    login = page.get_by_text("登录", exact=True)
-                    if await login.count():
-                        try:
-                            await login.first.click(timeout=10_000)
-                        except Exception:
-                            pass
-                    try:
-                        api_mode, token, qr_value = await asyncio.wait_for(
-                            qr_future, timeout=35
-                        )
-                    except asyncio.TimeoutError as exc:
-                        raise RuntimeError(
-                            "抖音暂时没有返回二维码，请检查网络后重试"
-                            + (f"（{last_error[:60]}）" if last_error else "")
-                        ) from exc
-                    poll_request = browser_context.request
-                    save_browser_state = True
+                page.on(
+                    "response",
+                    lambda response: asyncio.create_task(capture_login(response)),
+                )
+                await page.goto(
+                    "https://www.douyin.com/",
+                    wait_until="commit",
+                    timeout=20_000,
+                )
+
+                # 页面脚本到达后立即触发登录，不等待所有图片和视频加载。
+                try:
+                    login = page.get_by_text("登录", exact=True).first
+                    await login.wait_for(state="attached", timeout=5_000)
+                    await login.evaluate("(element) => element.click()")
+                except Exception:
+                    pass
+
+                try:
+                    qr_value = await asyncio.wait_for(qr_future, timeout=12)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("抖音二维码加载超时，请重试") from exc
 
                 encoded = (
                     qr_value.split(",", 1)[-1]
@@ -804,116 +769,66 @@ class DesktopApp:
                         qr_image.verify()
                 except Exception as exc:
                     raise RuntimeError("抖音返回的二维码格式无效") from exc
-                if len(qr_bytes) < 100:
-                    raise RuntimeError("抖音返回的二维码内容为空")
                 QR_PATH.write_bytes(qr_bytes)
                 self.root.after(0, self._show_qr_image)
 
-                # 后台浏览器生成的二维码必须由网页自身继续轮询。
-                # 手动重复请求会缺少页面动态生成的安全参数，导致手机确认后
-                # Cookie 永远不写入。这里直接等待网页完成官方登录流程。
-                if save_browser_state and browser_context and page:
-                    deadline = time.monotonic() + 240
-                    qr_was_visible = True
-                    while time.monotonic() < deadline:
-                        if self.qr_cancel_event.is_set():
-                            raise RuntimeError("登录已取消")
-                        cookies = await browser_context.cookies()
-                        authenticated = any(
-                            cookie.get("name") in {
-                                "sessionid",
-                                "sessionid_ss",
-                                "sid_guard",
-                            }
-                            and cookie.get("value")
-                            for cookie in cookies
-                        )
-                        if authenticated:
-                            # 给页面一点时间完成 Cookie 与本地存储同步。
-                            await page.wait_for_timeout(1200)
-                            tmp = STATE_PATH.with_suffix(".tmp")
-                            await browser_context.storage_state(path=str(tmp))
-                            tmp.replace(STATE_PATH)
-                            return
-
-                        try:
-                            qr_visible = await page.locator(
-                                "#animate_qrcode_container"
-                            ).is_visible(timeout=500)
-                        except Exception:
-                            qr_visible = False
-                        if qr_was_visible and not qr_visible:
-                            self.root.after(0, self._show_scanned_hint)
-                        qr_was_visible = qr_visible
-                        await page.wait_for_timeout(800)
-                    raise RuntimeError(
-                        "扫码确认后仍未完成登录；如果手机要求验证码，"
-                        "请先在抖音 App 内完成验证后重新扫码"
-                    )
-
-                deadline = time.monotonic() + 180
+                deadline = time.monotonic() + 240
+                redirect_url = ""
                 while time.monotonic() < deadline:
                     if self.qr_cancel_event.is_set():
                         raise RuntimeError("登录已取消")
-                    if api_mode == "passport":
-                        check_url = (
-                            "https://login.douyin.com/passport/web/check_qrconnect/"
-                            f"?aid=6383&token={token}"
-                        )
-                        response = await poll_request.post(
-                            check_url,
-                            form={
-                                "need_logo": "false",
-                                "is_frontier": "true",
-                                "token": token,
-                                "is_new_login": "1",
-                                "next": "https://www.douyin.com/",
-                                "need_short_url": "true",
-                            },
-                            timeout=20_000,
-                        )
-                    else:
-                        check_url = (
-                            "https://sso.douyin.com/check_qrconnect/"
-                            f"?aid=6383&token={token}"
-                            "&service=https%3A%2F%2Fwww.douyin.com"
-                            "&next=https%3A%2F%2Fwww.douyin.com%2F"
-                        )
-                        response = await poll_request.get(
-                            check_url, timeout=20_000
-                        )
 
-                    payload = await read_payload(response)
-                    data = payload.get("data") or {}
-                    try:
-                        status = int(data.get("status", 0))
-                    except (TypeError, ValueError):
-                        status = 0
-                    if status == 2:
-                        self.root.after(0, self._show_scanned_hint)
-                    elif status == 3:
-                        redirect_url = (
-                            data.get("redirect_url") or data.get("redirectUrl")
-                        )
-                        if redirect_url:
-                            await poll_request.get(
-                                str(redirect_url), timeout=30_000
-                            )
+                    if confirmed_future.done():
+                        redirect_url = confirmed_future.result()
+                    cookies = await context.cookies()
+                    authenticated = any(
+                        cookie.get("name") in {
+                            "sessionid",
+                            "sessionid_ss",
+                            "sid_guard",
+                        }
+                        and cookie.get("value")
+                        for cookie in cookies
+                    )
+                    if authenticated:
                         tmp = STATE_PATH.with_suffix(".tmp")
-                        if save_browser_state and browser_context:
-                            await browser_context.storage_state(path=str(tmp))
-                        else:
-                            await request.storage_state(path=str(tmp))
+                        await context.storage_state(path=str(tmp))
                         tmp.replace(STATE_PATH)
-                        return
-                    elif status == 5:
-                        raise RuntimeError("二维码已过期，请重新获取")
-                    await asyncio.sleep(1.5)
-                raise RuntimeError("二维码已过期，请重新获取")
+                        break
+
+                    # 确认响应已经到达但 Cookie 尚未同步时，立即完成重定向。
+                    if redirect_url:
+                        try:
+                            await page.goto(
+                                str(redirect_url),
+                                wait_until="commit",
+                                timeout=8_000,
+                            )
+                        except Exception:
+                            pass
+                        redirect_url = ""
+                    await page.wait_for_timeout(200)
+                else:
+                    raise RuntimeError(
+                        "扫码确认后仍未完成登录，请在抖音 App 内完成验证后重试"
+                    )
+
+                # 登录完成后读取公开昵称，用于多账号区分；失败不影响登录。
+                try:
+                    profile = await context.request.get(
+                        "https://www.douyin.com/aweme/v1/web/query/user/"
+                        "?device_platform=webapp&aid=6383"
+                        "&channel=channel_pc_web"
+                        "&publish_video_strategy_type=2",
+                        timeout=5_000,
+                    )
+                    self.pending_account_name = find_nickname(
+                        await read_payload(profile)
+                    )
+                except Exception:
+                    self.pending_account_name = ""
             finally:
-                if browser:
-                    await browser.close()
-                await request.dispose()
+                await browser.close()
 
 
     def _show_scanned_hint(self):
@@ -933,14 +848,39 @@ class DesktopApp:
         self.qr_label.configure(image=self.qr_image, text="")
 
     def _login_success(self):
+        nickname = self.pending_account_name.strip()
         if self.pending_new_account or not self.current_account_id:
             number = 1
             names = set(self._account_names())
-            while f"账号 {number}" in names:
+            base_name = nickname or "账号"
+            account_name = base_name
+            while account_name in names:
                 number += 1
-            account = {"id": f"account-{int(time.time())}", "name": f"账号 {number}"}
+                account_name = f"{base_name} ({number})"
+            account = {
+                "id": f"account-{int(time.time())}",
+                "name": account_name if nickname else f"账号 {number}",
+            }
             self.accounts.append(account)
             self.current_account_id = account["id"]
+        elif nickname:
+            current = next(
+                (item for item in self.accounts
+                 if item["id"] == self.current_account_id),
+                None,
+            )
+            if current:
+                used = {
+                    item["name"] for item in self.accounts
+                    if item["id"] != self.current_account_id
+                }
+                account_name = nickname
+                suffix = 2
+                while account_name in used:
+                    account_name = f"{nickname} ({suffix})"
+                    suffix += 1
+                current["name"] = account_name
+        self.pending_account_name = ""
         account_path = self._current_account_path()
         if account_path:
             shutil.copyfile(STATE_PATH, account_path)
