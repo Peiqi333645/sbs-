@@ -680,6 +680,7 @@ class DesktopApp:
             )
             browser = None
             browser_context = None
+            page = None
             poll_request = request
             save_browser_state = False
             try:
@@ -708,7 +709,7 @@ class DesktopApp:
                     if self.qr_cancel_event.is_set():
                         raise RuntimeError("登录已取消")
                     try:
-                        response = await request.get(endpoint, timeout=30_000)
+                        response = await request.get(endpoint, timeout=6_000)
                         payload = await read_payload(response)
                         data = payload.get("data") or {}
                         token = str(data.get("token") or "")
@@ -807,6 +808,48 @@ class DesktopApp:
                     raise RuntimeError("抖音返回的二维码内容为空")
                 QR_PATH.write_bytes(qr_bytes)
                 self.root.after(0, self._show_qr_image)
+
+                # 后台浏览器生成的二维码必须由网页自身继续轮询。
+                # 手动重复请求会缺少页面动态生成的安全参数，导致手机确认后
+                # Cookie 永远不写入。这里直接等待网页完成官方登录流程。
+                if save_browser_state and browser_context and page:
+                    deadline = time.monotonic() + 240
+                    qr_was_visible = True
+                    while time.monotonic() < deadline:
+                        if self.qr_cancel_event.is_set():
+                            raise RuntimeError("登录已取消")
+                        cookies = await browser_context.cookies()
+                        authenticated = any(
+                            cookie.get("name") in {
+                                "sessionid",
+                                "sessionid_ss",
+                                "sid_guard",
+                            }
+                            and cookie.get("value")
+                            for cookie in cookies
+                        )
+                        if authenticated:
+                            # 给页面一点时间完成 Cookie 与本地存储同步。
+                            await page.wait_for_timeout(1200)
+                            tmp = STATE_PATH.with_suffix(".tmp")
+                            await browser_context.storage_state(path=str(tmp))
+                            tmp.replace(STATE_PATH)
+                            return
+
+                        try:
+                            qr_visible = await page.locator(
+                                "#animate_qrcode_container"
+                            ).is_visible(timeout=500)
+                        except Exception:
+                            qr_visible = False
+                        if qr_was_visible and not qr_visible:
+                            self.root.after(0, self._show_scanned_hint)
+                        qr_was_visible = qr_visible
+                        await page.wait_for_timeout(800)
+                    raise RuntimeError(
+                        "扫码确认后仍未完成登录；如果手机要求验证码，"
+                        "请先在抖音 App 内完成验证后重新扫码"
+                    )
 
                 deadline = time.monotonic() + 180
                 while time.monotonic() < deadline:
