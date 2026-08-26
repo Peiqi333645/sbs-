@@ -86,6 +86,8 @@ class DesktopApp:
         self.pending_new_account = False
         self.pending_account_name = ""
         self.qr_cancel_event = threading.Event()
+        self.qr_prefetch_ready = threading.Event()
+        self.qr_worker_active = False
 
         self._prepare_runtime()
         self._build_ui()
@@ -94,6 +96,7 @@ class DesktopApp:
         self._refresh_login_state()
         self._render_target_status()
         threading.Thread(target=self._scheduler_loop, daemon=True).start()
+        self._begin_qr_prefetch()
         threading.Thread(
             target=self._account_name_backfill_worker, daemon=True
         ).start()
@@ -556,12 +559,31 @@ class DesktopApp:
         self.pending_new_account = True
         self.start_qr_login()
 
+    def _begin_qr_prefetch(self):
+        if self.qr_worker_active:
+            return
+        self.qr_cancel_event.clear()
+        self.qr_prefetch_ready.clear()
+        self.qr_worker_active = True
+        threading.Thread(target=self._qr_login_worker, daemon=True).start()
+
     def start_qr_login(self):
         if self.busy:
             return
-        self.qr_cancel_event.clear()
         self._open_qr_window()
         self._set_busy(True, "获取二维码")
+
+        # 软件启动时已经在后台准备二维码。点击后直接显示缓存结果，
+        # 并继续使用同一个浏览器会话等待扫码，不能另开会话。
+        if self.qr_worker_active:
+            if self.qr_prefetch_ready.is_set() and QR_PATH.exists():
+                self.root.after(0, self._show_qr_image)
+                self.activity_text.configure(text="二维码已准备好，请扫码")
+            return
+
+        self.qr_cancel_event.clear()
+        self.qr_prefetch_ready.clear()
+        self.qr_worker_active = True
         threading.Thread(target=self._qr_login_worker, daemon=True).start()
 
     def _open_qr_window(self):
@@ -634,8 +656,14 @@ class DesktopApp:
             self.root.after(0, self._login_success)
         except Exception as exc:
             if str(exc) != "登录已取消":
-                self.root.after(0, lambda error=str(exc): self._login_error(error))
+                # 后台预取失败时不弹出错误；用户真正打开扫码窗口后再提示。
+                if self.login_window and self.login_window.winfo_exists():
+                    self.root.after(
+                        0, lambda error=str(exc): self._login_error(error)
+                    )
         finally:
+            self.qr_worker_active = False
+            self.qr_prefetch_ready.clear()
             self._set_busy(False, "空闲")
 
     async def _qr_login(self):
@@ -773,6 +801,7 @@ class DesktopApp:
                 except Exception as exc:
                     raise RuntimeError("抖音返回的二维码格式无效") from exc
                 QR_PATH.write_bytes(qr_bytes)
+                self.qr_prefetch_ready.set()
                 self.root.after(0, self._show_qr_image)
 
                 deadline = time.monotonic() + 240
@@ -920,6 +949,8 @@ class DesktopApp:
         return ""
 
     def _account_name_backfill_worker(self):
+        # 先让二维码预热占用网络和浏览器冷启动资源，昵称迁移稍后执行。
+        time.sleep(8)
         generic = [
             item for item in self.accounts
             if item.get("name", "").startswith("账号 ")
