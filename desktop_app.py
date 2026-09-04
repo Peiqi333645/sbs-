@@ -16,7 +16,7 @@ from io import BytesIO
 
 import customtkinter as ctk
 from PIL import Image
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 from playwright.async_api import async_playwright
 
 from app.main import run
@@ -88,6 +88,10 @@ class DesktopApp:
         self.qr_cancel_event = threading.Event()
         self.qr_prefetch_ready = threading.Event()
         self.qr_worker_active = False
+        self.qr_expires_at = 0.0
+        self.qr_countdown_job = None
+        self.friend_rows: list[dict] = []
+        self.message_rows: list[dict] = []
 
         self._prepare_runtime()
         self._build_ui()
@@ -183,6 +187,8 @@ class DesktopApp:
             shell, fg_color=CANVAS, scrollbar_button_color="#D2D2CD"
         )
         body.pack(fill="both", expand=True, padx=24, pady=20)
+        self.body_scroll = body
+        self._stabilize_scroll_edges(body)
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=1)
 
@@ -247,41 +253,42 @@ class DesktopApp:
         self.logout_button.pack(side="right", padx=(0, 8))
 
         target_card = self._card(body, 0, 1, "02", "互动对象", "填写聊天列表中显示的完整备注或昵称")
-        self.friends = ctk.CTkTextbox(
-            target_card,
-            height=112,
-            corner_radius=12,
-            border_width=1,
-            border_color=BORDER,
-            fg_color="#FAFAF8",
-            text_color=INK,
-            font=ctk.CTkFont(size=14),
+        self.friends_list = ctk.CTkScrollableFrame(
+            target_card, height=132, corner_radius=12, border_width=1,
+            border_color=BORDER, fg_color="#FAFAF8",
+            scrollbar_button_color="#D2D2CD"
         )
-        self.friends.pack(fill="x", padx=22, pady=(4, 10))
+        self.friends_list.pack(fill="x", padx=22, pady=(4, 10))
+        self._stabilize_scroll_edges(self.friends_list)
         ctk.CTkLabel(
             target_card,
-            text="每行一个，最多 10 人。红色未发送，绿色已完成",
+            text="每位好友单独一行，可勾选是否参与；红色未发送，绿色已完成",
             text_color=MUTED,
             font=ctk.CTkFont(size=11),
         ).pack(anchor="w", padx=24, pady=(0, 8))
+        ctk.CTkButton(
+            target_card, text="＋ 添加好友", width=94, height=30,
+            corner_radius=9, fg_color="#EFEFED", hover_color="#E2E2DE",
+            text_color=INK, command=lambda: self._add_friend_row("")
+        ).pack(anchor="w", padx=22, pady=(0, 18))
         self.target_status_frame = ctk.CTkFrame(
             target_card, fg_color="#FAFAF8", corner_radius=12,
             border_width=1, border_color=BORDER
         )
-        self.target_status_frame.pack(fill="x", padx=22, pady=(0, 18))
 
         message_card = self._card(body, 1, 0, "03", "发送内容", "默认发送第一条，也可从多条内容中随机选择")
-        self.messages = ctk.CTkTextbox(
-            message_card,
-            height=124,
-            corner_radius=12,
-            border_width=1,
-            border_color=BORDER,
-            fg_color="#FAFAF8",
-            text_color=INK,
-            font=ctk.CTkFont(size=14),
+        self.messages_list = ctk.CTkScrollableFrame(
+            message_card, height=142, corner_radius=12, border_width=1,
+            border_color=BORDER, fg_color="#FAFAF8",
+            scrollbar_button_color="#D2D2CD"
         )
-        self.messages.pack(fill="x", padx=22, pady=(4, 10))
+        self.messages_list.pack(fill="x", padx=22, pady=(4, 10))
+        self._stabilize_scroll_edges(self.messages_list)
+        ctk.CTkButton(
+            message_card, text="＋ 添加内容", width=94, height=30,
+            corner_radius=9, fg_color="#EFEFED", hover_color="#E2E2DE",
+            text_color=INK, command=lambda: self._add_message_row("")
+        ).pack(anchor="w", padx=22, pady=(0, 8))
         mode_row = ctk.CTkFrame(message_card, fg_color="transparent")
         mode_row.pack(fill="x", padx=22, pady=(0, 18))
         ctk.CTkLabel(
@@ -323,14 +330,24 @@ class DesktopApp:
         ctk.CTkLabel(
             fixed_row, text="固定开始时间", text_color=MUTED, font=ctk.CTkFont(size=11)
         ).pack(side="left")
-        self.fixed_time = ctk.StringVar(value="21:00")
-        self.fixed_time_entry = ctk.CTkEntry(
-            fixed_row, textvariable=self.fixed_time, width=84, height=34,
+        self.fixed_hour = ctk.StringVar(value="21")
+        self.fixed_minute = ctk.StringVar(value="00")
+        self.fixed_minute_entry = ctk.CTkEntry(
+            fixed_row, textvariable=self.fixed_minute, width=42, height=34,
             corner_radius=10, border_color=BORDER, fg_color="#FFFFFF",
             justify="center", font=ctk.CTkFont(size=13, weight="bold"),
             state="disabled"
         )
-        self.fixed_time_entry.pack(side="right")
+        self.fixed_minute_entry.pack(side="right")
+        ctk.CTkLabel(fixed_row, text=":", width=18, text_color=INK,
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(side="right")
+        self.fixed_hour_entry = ctk.CTkEntry(
+            fixed_row, textvariable=self.fixed_hour, width=42, height=34,
+            corner_radius=10, border_color=BORDER, fg_color="#FFFFFF",
+            justify="center", font=ctk.CTkFont(size=13, weight="bold"),
+            state="disabled"
+        )
+        self.fixed_hour_entry.pack(side="right")
 
         switch_row = ctk.CTkFrame(schedule_card, fg_color="transparent")
         switch_row.pack(fill="x", padx=24, pady=(2, 20))
@@ -399,6 +416,129 @@ class DesktopApp:
             command=lambda: self.start_run(False),
         )
         self.run_button.grid(row=0, column=3, padx=(0, 18))
+
+    def _stabilize_scroll_edges(self, scroll_frame):
+        """Prevent macOS trackpads from repeatedly bouncing at scroll limits."""
+        canvas = getattr(scroll_frame, "_parent_canvas", None)
+        if canvas is None:
+            return
+
+        def clamp(_event=None):
+            first, last = canvas.yview()
+            if first < 0.0005:
+                canvas.yview_moveto(0)
+            elif last > 0.9995:
+                canvas.yview_moveto(1)
+        canvas.bind("<ButtonRelease-1>", clamp, add="+")
+        canvas.bind("<MouseWheel>", lambda _event: canvas.after_idle(clamp), add="+")
+
+    def _add_friend_row(self, name: str, selected: bool = True):
+        row = ctk.CTkFrame(self.friends_list, fg_color="transparent")
+        row.pack(fill="x", padx=5, pady=4)
+        enabled = ctk.BooleanVar(value=selected)
+        ctk.CTkCheckBox(
+            row, text="", variable=enabled, width=26, checkbox_width=20,
+            checkbox_height=20, fg_color=YELLOW, hover_color=YELLOW_HOVER,
+            border_color="#BDBDB8", command=self._render_target_status
+        ).pack(side="left", padx=(3, 5))
+        value = ctk.StringVar(value=name)
+        entry = ctk.CTkEntry(
+            row, textvariable=value, height=34, corner_radius=9,
+            border_color=BORDER, fg_color="#FFFFFF", text_color=INK
+        )
+        entry.pack(side="left", fill="x", expand=True)
+        badge = ctk.CTkLabel(
+            row, text="未发送", width=66, height=25, corner_radius=9,
+            fg_color="#FDECEC", text_color="#B52E2E",
+            font=ctk.CTkFont(size=11, weight="bold")
+        )
+        badge.pack(side="right", padx=(7, 3))
+        record = {"frame": row, "enabled": enabled, "value": value, "badge": badge}
+        self.friend_rows.append(record)
+        value.trace_add("write", lambda *_: self.root.after_idle(self._render_target_status))
+        return record
+
+    def _add_message_row(self, text: str):
+        row = ctk.CTkFrame(self.messages_list, fg_color="transparent")
+        row.pack(fill="x", padx=5, pady=4)
+        number = ctk.CTkLabel(
+            row, text=str(len(self.message_rows) + 1), width=27, height=27,
+            corner_radius=8, fg_color="#FFF4CC", text_color="#8A6300",
+            font=ctk.CTkFont(size=11, weight="bold")
+        )
+        number.pack(side="left", padx=(3, 7))
+        value = ctk.StringVar(value=text)
+        ctk.CTkEntry(
+            row, textvariable=value, height=34, corner_radius=9,
+            border_color=BORDER, fg_color="#FFFFFF", text_color=INK
+        ).pack(side="left", fill="x", expand=True)
+        record = {"frame": row, "value": value, "number": number}
+        self.message_rows.append(record)
+        ctk.CTkButton(
+            row, text="×", width=30, height=30, corner_radius=9,
+            fg_color="transparent", hover_color="#FDECEC", text_color=MUTED,
+            command=lambda: self._remove_message_row(record)
+        ).pack(side="right", padx=(5, 1))
+
+    def _remove_message_row(self, record):
+        if len(self.message_rows) == 1:
+            record["value"].set("")
+            return
+        record["frame"].destroy()
+        self.message_rows.remove(record)
+        for index, item in enumerate(self.message_rows, 1):
+            item["number"].configure(text=str(index))
+
+    def _friend_values(self, selected_only: bool = True):
+        return [
+            row["value"].get().strip() for row in self.friend_rows
+            if row["value"].get().strip() and (not selected_only or row["enabled"].get())
+        ]
+
+    def _message_values(self):
+        return [row["value"].get().strip() for row in self.message_rows if row["value"].get().strip()]
+
+    def _fixed_time_value(self):
+        return f"{self.fixed_hour.get().strip()}:{self.fixed_minute.get().strip()}"
+
+    def _account_config_path(self, account_id: str | None = None):
+        value = account_id if account_id is not None else self.current_account_id
+        return ACCOUNTS_DIR / f"{value}-config.json" if value else None
+
+    def _account_settings_path(self, account_id: str | None = None):
+        value = account_id if account_id is not None else self.current_account_id
+        return ACCOUNTS_DIR / f"{value}-settings.json" if value else None
+
+    def _reset_editor_state(self):
+        for row in self.friend_rows:
+            row["frame"].destroy()
+        self.friend_rows.clear()
+        self._add_friend_row("")
+        for row in self.message_rows:
+            row["frame"].destroy()
+        self.message_rows.clear()
+        self._add_message_row("")
+        self.schedule_enabled.set(False)
+        self.plan_mode.set("随机时间")
+        self.fixed_hour.set("21")
+        self.fixed_minute.set("00")
+        self.daily_plan = []
+        self._plan_mode_changed("随机时间", save=False)
+        self._render_target_status()
+
+    def _load_account_ui_state(self):
+        config_path = self._account_config_path()
+        settings_path = self._account_settings_path()
+        if not config_path or not config_path.exists():
+            self._reset_editor_state()
+            return
+        shutil.copyfile(config_path, CONFIG_PATH)
+        if settings_path and settings_path.exists():
+            shutil.copyfile(settings_path, SETTINGS_PATH)
+        elif SETTINGS_PATH.exists():
+            SETTINGS_PATH.unlink()
+        self._load_config()
+        self._load_settings()
 
     def _pill_selector(self, parent, values, variable, command=None):
         track = ctk.CTkFrame(parent, fg_color="#EFEFED", corner_radius=15, height=38)
@@ -469,15 +609,23 @@ class DesktopApp:
 
     def _load_config(self):
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        self.friends.delete("1.0", "end")
-        self.friends.insert("1.0", "\n".join(data.get("friends", [])))
+        for row in self.friend_rows:
+            row["frame"].destroy()
+        self.friend_rows.clear()
+        selected = set(data.get("friends", []))
+        saved_rows = data.get("friend_rows") or data.get("friends", []) or [""]
+        for name in saved_rows:
+            self._add_friend_row(name, name in selected or not name)
         texts = [
             item.get("value") or item.get("content", "")
             for item in data.get("messages", [])
             if item.get("type") == "text"
         ]
-        self.messages.delete("1.0", "end")
-        self.messages.insert("1.0", "\n".join(texts))
+        for row in self.message_rows:
+            row["frame"].destroy()
+        self.message_rows.clear()
+        for text in texts or [""]:
+            self._add_message_row(text)
 
     def _load_settings(self):
         if SETTINGS_PATH.exists():
@@ -492,15 +640,17 @@ class DesktopApp:
                 }
                 self.message_mode.set(legacy_modes.get(saved_mode, saved_mode))
                 self.plan_mode.set(data.get("plan_mode", "随机时间"))
-                self.fixed_time.set(data.get("fixed_time", "21:00"))
+                hour, minute = (data.get("fixed_time", "21:00").split(":") + ["00"])[:2]
+                self.fixed_hour.set(hour)
+                self.fixed_minute.set(minute)
                 self._plan_mode_changed(self.plan_mode.get(), save=False)
                 self._load_daily_plan()
             except Exception:
                 pass
 
     def save_config(self, silent: bool = False):
-        friends = [line.strip() for line in self.friends.get("1.0", "end").splitlines() if line.strip()]
-        messages = [line.strip() for line in self.messages.get("1.0", "end").splitlines() if line.strip()]
+        friends = self._friend_values()
+        messages = self._message_values()
         if not friends:
             if not silent:
                 messagebox.showwarning(APP_NAME, "请至少填写一位互动对象。")
@@ -511,19 +661,18 @@ class DesktopApp:
             if not silent:
                 messagebox.showwarning(APP_NAME, "默认第一条模式需要至少填写一条内容。")
             return False
-        if len(friends) > 10:
-            if not silent:
-                messagebox.showwarning(APP_NAME, "为降低账号风险，第一版最多设置 10 位互动对象。")
-            return False
         if self.plan_mode.get() == "固定时间":
             try:
-                datetime.strptime(self.fixed_time.get().strip(), "%H:%M")
+                parsed_time = datetime.strptime(self._fixed_time_value(), "%H:%M")
+                self.fixed_hour.set(f"{parsed_time.hour:02d}")
+                self.fixed_minute.set(f"{parsed_time.minute:02d}")
             except ValueError:
                 if not silent:
                     messagebox.showwarning(APP_NAME, "固定时间请使用 24 小时格式，例如 21:00。")
                 return False
         config = dict(DEFAULT_CONFIG)
         config["friends"] = friends
+        config["friend_rows"] = self._friend_values(selected_only=False)
         config["messages"] = [{"type": "text", "value": text} for text in messages]
         CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
         SETTINGS_PATH.write_text(
@@ -532,13 +681,18 @@ class DesktopApp:
                     "schedule_enabled": self.schedule_enabled.get(),
                     "message_mode": self.message_mode.get(),
                     "plan_mode": self.plan_mode.get(),
-                    "fixed_time": self.fixed_time.get().strip(),
+                    "fixed_time": self._fixed_time_value(),
                 },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
         )
+        account_config = self._account_config_path()
+        account_settings = self._account_settings_path()
+        if account_config and account_settings:
+            shutil.copyfile(CONFIG_PATH, account_config)
+            shutil.copyfile(SETTINGS_PATH, account_settings)
         self.activity_text.configure(text="设置已保存")
         self._ensure_daily_plan(force=True)
         self._render_target_status()
@@ -576,9 +730,12 @@ class DesktopApp:
         # 软件启动时已经在后台准备二维码。点击后直接显示缓存结果，
         # 并继续使用同一个浏览器会话等待扫码，不能另开会话。
         if self.qr_worker_active:
-            if self.qr_prefetch_ready.is_set() and QR_PATH.exists():
+            if (self.qr_prefetch_ready.is_set() and QR_PATH.exists()
+                    and self.qr_expires_at > time.monotonic()):
                 self.root.after(0, self._show_qr_image)
                 self.activity_text.configure(text="二维码已准备好，请扫码")
+            elif self.qr_prefetch_ready.is_set():
+                self._login_error("二维码已失效，请稍候重新打开扫码页")
             return
 
         self.qr_cancel_event.clear()
@@ -592,7 +749,7 @@ class DesktopApp:
         window = ctk.CTkToplevel(self.root)
         self.login_window = window
         window.title("扫码登录")
-        window.geometry("460x590")
+        window.geometry("460x650")
         window.resizable(False, False)
         window.configure(fg_color=CANVAS)
         window.transient(self.root)
@@ -630,6 +787,17 @@ class DesktopApp:
             text_color=MUTED,
             font=ctk.CTkFont(size=11),
         ).pack()
+        self.qr_countdown_label = ctk.CTkLabel(
+            window, text="", text_color="#8A6300",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.qr_countdown_label.pack(pady=(8, 0))
+        ctk.CTkButton(
+            window, text="保存原始二维码（可传到手机相册识别）",
+            width=250, height=34, corner_radius=10, fg_color="#FFF4CC",
+            hover_color="#FFE79A", text_color="#7A5600",
+            command=self._save_qr_image
+        ).pack(pady=(8, 0))
         ctk.CTkButton(
             window,
             text="取消",
@@ -649,6 +817,30 @@ class DesktopApp:
             self.login_window.destroy()
         self.activity_text.configure(text="已取消扫码登录")
         self._set_busy(False, "空闲")
+
+    def _save_qr_image(self):
+        if not QR_PATH.exists():
+            messagebox.showwarning(APP_NAME, "二维码还没有准备好。")
+            return
+        destination = filedialog.asksaveasfilename(
+            title="保存抖音登录二维码", defaultextension=".png",
+            filetypes=[("PNG 图片", "*.png")], initialfile="douyin-login-qr.png"
+        )
+        if destination:
+            shutil.copyfile(QR_PATH, destination)
+            self.activity_text.configure(text="原始二维码已保存，可传到手机后从相册识别")
+
+    def _update_qr_countdown(self):
+        if not self.login_window or not self.login_window.winfo_exists():
+            return
+        remaining = max(0, int(self.qr_expires_at - time.monotonic()))
+        if hasattr(self, "qr_countdown_label"):
+            self.qr_countdown_label.configure(
+                text=f"二维码将在 {remaining // 60:02d}:{remaining % 60:02d} 后失效"
+                if remaining else "二维码已失效，请关闭后重新扫码"
+            )
+        if remaining:
+            self.qr_countdown_job = self.root.after(1000, self._update_qr_countdown)
 
     def _qr_login_worker(self):
         try:
@@ -743,7 +935,12 @@ class DesktopApp:
                             data.get("qrcode") or data.get("qr_code") or ""
                         )
                         if token and qr_value:
-                            qr_future.set_result(qr_value)
+                            raw_expiry = data.get("expires_in") or data.get("expire_seconds") or 240
+                            try:
+                                expiry_seconds = max(1, min(600, int(raw_expiry)))
+                            except (TypeError, ValueError):
+                                expiry_seconds = 240
+                            qr_future.set_result((qr_value, expiry_seconds))
                         return
                     if "check_qrconnect" in url:
                         payload = await read_payload(response)
@@ -784,7 +981,7 @@ class DesktopApp:
                     pass
 
                 try:
-                    qr_value = await asyncio.wait_for(qr_future, timeout=12)
+                    qr_value, expiry_seconds = await asyncio.wait_for(qr_future, timeout=12)
                 except asyncio.TimeoutError as exc:
                     raise RuntimeError("抖音二维码加载超时，请重试") from exc
 
@@ -801,10 +998,11 @@ class DesktopApp:
                 except Exception as exc:
                     raise RuntimeError("抖音返回的二维码格式无效") from exc
                 QR_PATH.write_bytes(qr_bytes)
+                self.qr_expires_at = time.monotonic() + expiry_seconds
                 self.qr_prefetch_ready.set()
                 self.root.after(0, self._show_qr_image)
 
-                deadline = time.monotonic() + 240
+                deadline = self.qr_expires_at
                 redirect_url = ""
                 while time.monotonic() < deadline:
                     if self.qr_cancel_event.is_set():
@@ -845,10 +1043,9 @@ class DesktopApp:
                         "扫码确认后仍未完成登录，请在抖音 App 内完成验证后重试"
                     )
 
-                # 接口、页面内嵌数据和“我的”入口多路读取昵称。
-                self.pending_account_name = await self._resolve_profile_name(
-                    page, context
-                )
+                # 登录凭证落盘后立即完成，不再让昵称接口拖慢成功反馈。
+                # 通用名称会由后台回填线程在稍后安全更新。
+                self.pending_account_name = ""
             finally:
                 await browser.close()
 
@@ -868,6 +1065,7 @@ class DesktopApp:
         canvas.paste(image, ((300 - image.width) // 2, (320 - image.height) // 2))
         self.qr_image = ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(300, 320))
         self.qr_label.configure(image=self.qr_image, text="")
+        self._update_qr_countdown()
 
     @staticmethod
     def _find_profile_nickname(value):
@@ -1007,17 +1205,23 @@ class DesktopApp:
 
     def _login_success(self):
         nickname = self.pending_account_name.strip()
-        if self.pending_new_account or not self.current_account_id:
-            number = 1
+        created_account = self.pending_new_account or not self.current_account_id
+        if created_account:
             names = set(self._account_names())
-            base_name = nickname or "账号"
-            account_name = base_name
-            while account_name in names:
-                number += 1
-                account_name = f"{base_name} ({number})"
+            number = 1
+            if nickname:
+                account_name = nickname
+                while account_name in names:
+                    number += 1
+                    account_name = f"{nickname} ({number})"
+            else:
+                account_name = f"账号 {number}"
+                while account_name in names:
+                    number += 1
+                    account_name = f"账号 {number}"
             account = {
-                "id": f"account-{int(time.time())}",
-                "name": account_name if nickname else f"账号 {number}",
+                "id": f"account-{time.time_ns()}",
+                "name": account_name,
             }
             self.accounts.append(account)
             self.current_account_id = account["id"]
@@ -1046,11 +1250,22 @@ class DesktopApp:
         self._save_account_registry()
         self._refresh_account_menu()
         self._refresh_login_state()
+        if created_account:
+            self._reset_editor_state()
         self.risk_badge.configure(text="●  状态正常", fg_color="#173D2C", text_color="#6FE0A5")
         self.activity_text.configure(text=f"{self._current_account_name()} 登录成功")
         if self.login_window and self.login_window.winfo_exists():
             self.login_window.destroy()
         messagebox.showinfo(APP_NAME, "登录成功，登录状态已安全保存在本机。")
+        current = next(
+            (item for item in self.accounts if item["id"] == self.current_account_id),
+            None,
+        )
+        if current and current["name"].startswith("账号 "):
+            threading.Thread(
+                target=lambda: asyncio.run(self._backfill_account_names([current])),
+                daemon=True,
+            ).start()
 
     def _login_error(self, error: str):
         if self.qr_label and self.qr_label.winfo_exists():
@@ -1103,7 +1318,7 @@ class DesktopApp:
     def _refresh_account_menu(self):
         values = self._account_names() or ["暂无账号"]
         self.account_menu.configure(values=values)
-        self.account_name.set(self._current_account_name())
+        self.account_name.set(self._current_account_name() if self.current_account_id else "暂无账号")
 
     def _account_selected(self, selected: str):
         account = next((a for a in self.accounts if a["name"] == selected), None)
@@ -1115,7 +1330,7 @@ class DesktopApp:
             return
         self.current_account_id = account["id"]
         self._activate_current_account()
-        self.daily_plan = []
+        self._load_account_ui_state()
         self.risk_stopped = False
         self._load_daily_plan()
         self._save_account_registry()
@@ -1136,15 +1351,19 @@ class DesktopApp:
             return
         current = self.current_account_id
         self._invalidate_current_account()
+        for path in (self._account_config_path(current), self._account_settings_path(current)):
+            if path and path.exists():
+                path.unlink()
         self.accounts = [a for a in self.accounts if a["id"] != current]
-        self.current_account_id = self.accounts[0]["id"] if self.accounts else ""
+        # 退出后不自动切换到别的账号，界面回到明确的未登录默认态。
+        self.current_account_id = ""
         self._activate_current_account()
         self.daily_plan = []
         self._load_daily_plan()
         self._save_account_registry()
         self._refresh_account_menu()
         self._refresh_login_state()
-        self._render_target_status()
+        self._reset_editor_state()
         self.activity_text.configure(text="当前账号已退出并移除")
 
     def start_run(self, dry_run: bool):
@@ -1192,7 +1411,9 @@ class DesktopApp:
 
     def _plan_mode_changed(self, selected: str, save: bool = True):
         fixed = selected == "固定时间"
-        self.fixed_time_entry.configure(state="normal" if fixed else "disabled")
+        state = "normal" if fixed else "disabled"
+        self.fixed_hour_entry.configure(state=state)
+        self.fixed_minute_entry.configure(state=state)
         self.plan_title.configure(text="每天按固定时间开始" if fixed else "每天自动生成分散时间")
         self.plan_description.configure(
             text="从设定时间开始，好友之间仍保留自然间隔"
@@ -1225,8 +1446,11 @@ class DesktopApp:
             "schedule_enabled": self.schedule_enabled.get(),
             "message_mode": self.message_mode.get(),
             "plan_mode": self.plan_mode.get(),
-            "fixed_time": self.fixed_time.get().strip(),
+            "fixed_time": self._fixed_time_value(),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
+        account_settings = self._account_settings_path()
+        if account_settings:
+            shutil.copyfile(SETTINGS_PATH, account_settings)
 
     def _load_daily_plan(self):
         status_path = self._daily_status_path()
@@ -1241,14 +1465,14 @@ class DesktopApp:
             self.daily_plan = []
 
     def _ensure_daily_plan(self, force: bool = False):
-        friends = [line.strip() for line in self.friends.get("1.0", "end").splitlines() if line.strip()]
+        friends = self._friend_values()
         today = datetime.now().strftime("%Y-%m-%d")
         existing_names = [item.get("friend") for item in self.daily_plan]
         if not force and self.daily_plan and existing_names == friends:
             return
         now = datetime.now()
         if self.plan_mode.get() == "固定时间":
-            fixed = datetime.strptime(self.fixed_time.get().strip(), "%H:%M")
+            fixed = datetime.strptime(self._fixed_time_value(), "%H:%M")
             start = now.replace(hour=fixed.hour, minute=fixed.minute, second=0, microsecond=0)
             if start <= now:
                 start += timedelta(days=1)
@@ -1289,43 +1513,27 @@ class DesktopApp:
     def _render_target_status(self):
         if not hasattr(self, "target_status_frame"):
             return
-        for widget in self.target_status_frame.winfo_children():
-            widget.destroy()
-        friends = [line.strip() for line in self.friends.get("1.0", "end").splitlines() if line.strip()]
+        friends = self._friend_values()
         by_name = {item.get("friend"): item for item in self.daily_plan}
-        if not friends:
-            ctk.CTkLabel(
-                self.target_status_frame, text="添加好友后显示今日状态",
-                text_color=MUTED, font=ctk.CTkFont(size=12)
-            ).pack(anchor="w", padx=14, pady=14)
-            return
         styles = {
             "success": ("已完成", "#E8F7EF", "#147A49"),
             "running": ("正在发送", "#FFF4CC", "#8A6300"),
             "failed": ("已停止", "#FDECEC", "#B52E2E"),
             "pending": ("未发送", "#FDECEC", "#B52E2E"),
         }
-        for index, friend in enumerate(friends):
+        for row_data in self.friend_rows:
+            friend = row_data["value"].get().strip()
+            badge = row_data["badge"]
+            if not friend:
+                badge.configure(text="未设置", fg_color="#EFEFED", text_color=MUTED)
+                continue
+            if not row_data["enabled"].get():
+                badge.configure(text="已取消", fg_color="#EFEFED", text_color=MUTED)
+                continue
             item = by_name.get(friend, {})
             status = item.get("status", "pending")
             label, badge_bg, badge_text = styles.get(status, styles["pending"])
-            when = item.get("time", "")
-            clock = datetime.fromisoformat(when).strftime("%H:%M") if when else "--:--"
-            row = ctk.CTkFrame(self.target_status_frame, fg_color="transparent", corner_radius=0)
-            row.pack(fill="x", padx=12, pady=(9 if index == 0 else 4, 9 if index == len(friends) - 1 else 4))
-            ctk.CTkLabel(
-                row, text=friend, text_color=INK, anchor="w",
-                font=ctk.CTkFont(size=12, weight="bold")
-            ).pack(side="left")
-            ctk.CTkLabel(
-                row, text=label, width=70, height=25, corner_radius=9,
-                fg_color=badge_bg, text_color=badge_text,
-                font=ctk.CTkFont(size=11, weight="bold")
-            ).pack(side="right")
-            if status == "pending":
-                ctk.CTkLabel(
-                    row, text=clock, text_color=MUTED, font=ctk.CTkFont(size=11)
-                ).pack(side="right", padx=(0, 8))
+            badge.configure(text=label, fg_color=badge_bg, text_color=badge_text)
 
 
     def _scheduler_loop(self):
