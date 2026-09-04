@@ -89,6 +89,7 @@ class DesktopApp:
         self.qr_cancel_event = threading.Event()
         self.qr_prefetch_ready = threading.Event()
         self.qr_worker_active = False
+        self.qr_session_id = 0
         self.qr_expires_at = 0.0
         self.qr_countdown_job = None
         self.friend_rows: list[dict] = []
@@ -762,16 +763,22 @@ class DesktopApp:
         self.qr_cancel_event.clear()
         self.qr_prefetch_ready.clear()
         self.qr_expires_at = 0.0
+        self._launch_qr_worker()
+
+    def _launch_qr_worker(self):
+        self.qr_session_id += 1
+        session_id = self.qr_session_id
         self.qr_worker_active = True
-        threading.Thread(target=self._qr_login_worker, daemon=True).start()
+        threading.Thread(
+            target=self._qr_login_worker, args=(session_id,), daemon=True
+        ).start()
 
     def _begin_qr_prefetch(self):
         if self.qr_worker_active:
             return
         self.qr_cancel_event.clear()
         self.qr_prefetch_ready.clear()
-        self.qr_worker_active = True
-        threading.Thread(target=self._qr_login_worker, daemon=True).start()
+        self._launch_qr_worker()
 
     def start_qr_login(self):
         if self.busy:
@@ -782,6 +789,9 @@ class DesktopApp:
         # 软件启动时已经在后台准备二维码。点击后直接显示缓存结果，
         # 并继续使用同一个浏览器会话等待扫码，不能另开会话。
         if self.qr_worker_active:
+            if self.qr_cancel_event.is_set():
+                self.root.after(100, self._restart_cancelled_qr)
+                return
             if (self.qr_prefetch_ready.is_set() and QR_PATH.exists()
                     and self.qr_expires_at > time.monotonic()):
                 self.root.after(0, self._show_qr_image)
@@ -792,8 +802,18 @@ class DesktopApp:
 
         self.qr_cancel_event.clear()
         self.qr_prefetch_ready.clear()
-        self.qr_worker_active = True
-        threading.Thread(target=self._qr_login_worker, daemon=True).start()
+        self._launch_qr_worker()
+
+    def _restart_cancelled_qr(self):
+        if not self.login_window or not self.login_window.winfo_exists():
+            return
+        if self.qr_worker_active:
+            self.root.after(100, self._restart_cancelled_qr)
+            return
+        self.qr_cancel_event.clear()
+        self.qr_prefetch_ready.clear()
+        self.qr_expires_at = 0.0
+        self._launch_qr_worker()
 
     def _open_qr_window(self):
         if self.login_window and self.login_window.winfo_exists():
@@ -864,6 +884,7 @@ class DesktopApp:
 
     def _cancel_login(self):
         self.pending_new_account = False
+        self.qr_session_id += 1
         self.qr_cancel_event.set()
         if self.login_window and self.login_window.winfo_exists():
             self.login_window.destroy()
@@ -894,23 +915,25 @@ class DesktopApp:
         if remaining:
             self.qr_countdown_job = self.root.after(1000, self._update_qr_countdown)
 
-    def _qr_login_worker(self):
+    def _qr_login_worker(self, session_id: int):
         try:
-            asyncio.run(self._qr_login())
-            self.root.after(0, self._login_success)
+            asyncio.run(self._qr_login(session_id))
+            if session_id == self.qr_session_id:
+                self.root.after(0, self._login_success)
         except Exception as exc:
-            if str(exc) != "登录已取消":
-                # 后台预取失败时不弹出错误；用户真正打开扫码窗口后再提示。
-                if self.login_window and self.login_window.winfo_exists():
-                    self.root.after(
-                        0, lambda error=str(exc): self._login_error(error)
-                    )
+            if str(exc) != "登录已取消" and session_id == self.qr_session_id:
+                self.root.after(
+                    0, lambda error=str(exc): self._login_error(error)
+                )
         finally:
-            self.qr_worker_active = False
-            self.qr_prefetch_ready.clear()
-            self._set_busy(False, "空闲")
+            if session_id == self.qr_session_id:
+                self.qr_worker_active = False
+                self.qr_prefetch_ready.clear()
+                self._set_busy(False, "空闲")
+            elif self.qr_cancel_event.is_set():
+                self.qr_worker_active = False
 
-    async def _qr_login(self):
+    async def _qr_login(self, session_id: int):
         if QR_PATH.exists():
             QR_PATH.unlink()
         self.pending_account_name = ""
@@ -1003,7 +1026,8 @@ class DesktopApp:
                         except (TypeError, ValueError):
                             status = 0
                         if status == 2:
-                            self.root.after(0, self._show_scanned_hint)
+                            if session_id == self.qr_session_id:
+                                self.root.after(0, self._show_scanned_hint)
                         elif status == 3 and not confirmed_future.done():
                             confirmed_future.set_result(
                                 data.get("redirect_url")
@@ -1011,7 +1035,8 @@ class DesktopApp:
                                 or ""
                             )
                         elif status in {4, 5} and not confirmed_future.done():
-                            self.root.after(0, self._mark_qr_expired)
+                            if session_id == self.qr_session_id:
+                                self.root.after(0, self._mark_qr_expired)
                             confirmed_future.set_exception(
                                 RuntimeError("二维码已过期，请重新获取")
                             )
@@ -1039,6 +1064,9 @@ class DesktopApp:
                 except asyncio.TimeoutError as exc:
                     raise RuntimeError("抖音二维码加载超时，请重试") from exc
 
+                if session_id != self.qr_session_id:
+                    raise RuntimeError("登录已取消")
+
                 encoded = (
                     qr_value.split(",", 1)[-1]
                     if "base64," in qr_value
@@ -1054,16 +1082,19 @@ class DesktopApp:
                 QR_PATH.write_bytes(qr_bytes)
                 self.qr_expires_at = time.monotonic() + expiry_seconds
                 self.qr_prefetch_ready.set()
-                self.root.after(0, self._show_qr_image)
+                if session_id == self.qr_session_id:
+                    self.root.after(0, self._show_qr_image)
 
                 deadline = self.qr_expires_at
                 redirect_url = ""
+                confirmation_handled = False
                 while time.monotonic() < deadline:
-                    if self.qr_cancel_event.is_set():
+                    if self.qr_cancel_event.is_set() or session_id != self.qr_session_id:
                         raise RuntimeError("登录已取消")
 
-                    if confirmed_future.done():
+                    if confirmed_future.done() and not confirmation_handled:
                         redirect_url = confirmed_future.result()
+                        confirmation_handled = True
                     cookies = await context.cookies()
                     authenticated = any(
                         cookie.get("name") in {
@@ -1091,6 +1122,19 @@ class DesktopApp:
                         except Exception:
                             pass
                         redirect_url = ""
+                        # 抖音已返回确认成功。跳转只执行一次，等待浏览器写入
+                        # Cookie/localStorage 后保存完整状态，不再依赖旧 Cookie 名。
+                        await page.wait_for_timeout(1_000)
+                        tmp = STATE_PATH.with_suffix(".tmp")
+                        await context.storage_state(path=str(tmp))
+                        tmp.replace(STATE_PATH)
+                        break
+                    if confirmation_handled:
+                        await page.wait_for_timeout(1_000)
+                        tmp = STATE_PATH.with_suffix(".tmp")
+                        await context.storage_state(path=str(tmp))
+                        tmp.replace(STATE_PATH)
+                        break
                     await page.wait_for_timeout(200)
                 else:
                     raise RuntimeError(
