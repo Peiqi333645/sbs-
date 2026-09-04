@@ -1021,24 +1021,28 @@ class DesktopApp:
                     if "check_qrconnect" in url:
                         payload = await read_payload(response)
                         data = payload.get("data") or {}
-                        try:
-                            status = int(data.get("status", 0))
-                        except (TypeError, ValueError):
-                            status = 0
-                        if status == 2:
+                        raw_status = data.get("status", "")
+                        status = str(raw_status).strip().lower()
+                        if status in {"2", "scanned"}:
                             if session_id == self.qr_session_id:
                                 self.root.after(0, self._show_scanned_hint)
-                        elif status == 3 and not confirmed_future.done():
+                        elif status in {"3", "confirmed"} and not confirmed_future.done():
                             confirmed_future.set_result(
                                 data.get("redirect_url")
                                 or data.get("redirectUrl")
                                 or ""
                             )
-                        elif status in {4, 5} and not confirmed_future.done():
+                        elif status in {"4", "5", "expired"} and not confirmed_future.done():
                             if session_id == self.qr_session_id:
                                 self.root.after(0, self._mark_qr_expired)
                             confirmed_future.set_exception(
                                 RuntimeError("二维码已过期，请重新获取")
+                            )
+                        error_code = payload.get("status_code") or payload.get("error_code")
+                        if error_code not in {None, 0, "0"} and not confirmed_future.done():
+                            message = payload.get("message") or payload.get("status_msg") or "抖音拒绝了本次登录"
+                            confirmed_future.set_exception(
+                                RuntimeError(f"抖音登录受限（{error_code}）：{message}")
                             )
 
                 page.on(
