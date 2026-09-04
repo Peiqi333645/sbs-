@@ -211,6 +211,11 @@ class DesktopApp:
             fg_color="#FFF4CC", hover_color="#FFE79A", text_color="#7A5600",
             command=self.add_account
         ).pack(side="right", padx=8, pady=8)
+        ctk.CTkButton(
+            account_row, text="修改名称", width=72, height=34, corner_radius=10,
+            fg_color="#EFEFED", hover_color="#E1E1DD", text_color=INK,
+            command=self._rename_current_account
+        ).pack(side="right", pady=8)
 
         login_row = ctk.CTkFrame(login_card, fg_color="transparent")
         login_row.pack(fill="x", padx=22, pady=(0, 18))
@@ -320,7 +325,7 @@ class DesktopApp:
         )
         self.plan_title.pack(anchor="w", padx=16, pady=(14, 2))
         self.plan_description = ctk.CTkLabel(
-            plan_box, text="09:30–21:30 分段安排，每位好友单独执行",
+            plan_box, text="01:00–23:00 分段安排，确保当天完成",
             text_color=MUTED, font=ctk.CTkFont(size=11)
         )
         self.plan_description.pack(anchor="w", padx=16, pady=(0, 10))
@@ -1179,7 +1184,7 @@ class DesktopApp:
         # 单独的用户资料接口，适合接口灰度或字段变化时兜底。
         try:
             await page.goto(
-                "https://www.douyin.com/",
+                "https://www.douyin.com/user/self?from_tab_name=main",
                 wait_until="domcontentloaded",
                 timeout=12_000,
             )
@@ -1200,14 +1205,18 @@ class DesktopApp:
         except Exception:
             pass
 
-        # 最后读取顶部“我的”入口附近的账号名称。
+        # 最后读取个人主页标题、用户资料区及页面标题。
         try:
             candidates = await page.locator(
-                'a[href*="/user/"], [data-e2e*="user"]'
-            ).all_inner_texts()
+                'h1, [data-e2e*="user"], [class*="user-info"], '
+                'meta[property="og:title"]'
+            ).evaluate_all(
+                "els => els.map(el => el.content || el.innerText || '')"
+            )
+            candidates.append(await page.title())
             ignored = {"我的", "用户", "个人主页", "登录"}
             for text in candidates:
-                name = " ".join(text.split()).strip()
+                name = " ".join(text.split()).strip().removesuffix(" - 抖音")
                 if name and name not in ignored and 1 < len(name) <= 40:
                     return name
         except Exception:
@@ -1233,6 +1242,7 @@ class DesktopApp:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             changed = False
+            unresolved = []
             try:
                 for account in accounts:
                     state_path = ACCOUNTS_DIR / f"{account['id']}.json"
@@ -1256,6 +1266,8 @@ class DesktopApp:
                                 suffix += 1
                             account["name"] = display_name
                             changed = True
+                        else:
+                            unresolved.append(account["id"])
                     finally:
                         await context.close()
             finally:
@@ -1270,6 +1282,38 @@ class DesktopApp:
                         text="已同步抖音账号名称"
                     ),
                 )
+            for account_id in unresolved:
+                self.root.after(
+                    0, lambda value=account_id: self._request_account_name(value)
+                )
+
+    def _request_account_name(self, account_id: str):
+        account = next((item for item in self.accounts if item["id"] == account_id), None)
+        if not account:
+            return
+        dialog = ctk.CTkInputDialog(
+            title="设置账号名称",
+            text="请输入这个账号需要显示的抖音昵称：",
+        )
+        name = (dialog.get_input() or "").strip()
+        if not name:
+            return
+        used = {item["name"] for item in self.accounts if item["id"] != account_id}
+        display_name = name
+        suffix = 2
+        while display_name in used:
+            display_name = f"{name} ({suffix})"
+            suffix += 1
+        account["name"] = display_name
+        self._save_account_registry()
+        self._refresh_account_menu()
+        self._refresh_login_state()
+
+    def _rename_current_account(self):
+        if not self.current_account_id:
+            messagebox.showwarning(APP_NAME, "请先登录一个抖音账号。")
+            return
+        self._request_account_name(self.current_account_id)
 
 
     def _login_success(self):
@@ -1486,7 +1530,7 @@ class DesktopApp:
         self.plan_title.configure(text="每天按固定时间开始" if fixed else "每天自动生成分散时间")
         self.plan_description.configure(
             text="从设定时间开始，好友之间仍保留自然间隔"
-            if fixed else "09:30–21:30 分段安排，每位好友单独执行"
+            if fixed else "01:00–23:00 分段安排，确保当天完成"
         )
         if save and hasattr(self, "schedule_enabled"):
             self._ensure_daily_plan(force=True)
@@ -1551,13 +1595,15 @@ class DesktopApp:
                 slots.append(cursor)
                 cursor += random.randint(120, 300)
         else:
-            start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-            end = now.replace(hour=21, minute=30, second=0, microsecond=0)
+            start = now.replace(hour=1, minute=0, second=0, microsecond=0)
+            end = now.replace(hour=23, minute=0, second=0, microsecond=0)
             if now > start:
                 start = now + timedelta(minutes=5)
             if start >= end:
-                start = now + timedelta(minutes=2)
-                end = now + timedelta(hours=2)
+                start = (now + timedelta(days=1)).replace(
+                    hour=1, minute=0, second=0, microsecond=0
+                )
+                end = start.replace(hour=23)
             span = max(1, int((end - start).total_seconds()))
             count = len(friends)
             bucket = span / max(1, count)
