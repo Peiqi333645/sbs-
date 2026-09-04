@@ -92,18 +92,17 @@ class DesktopApp:
         self.qr_countdown_job = None
         self.friend_rows: list[dict] = []
         self.message_rows: list[dict] = []
+        self.scroll_canvases = []
 
         self._prepare_runtime()
         self._build_ui()
+        self.root.bind_all("<MouseWheel>", self._route_mousewheel)
         self._load_config()
         self._load_settings()
         self._refresh_login_state()
         self._render_target_status()
         threading.Thread(target=self._scheduler_loop, daemon=True).start()
         self._begin_qr_prefetch()
-        threading.Thread(
-            target=self._account_name_backfill_worker, daemon=True
-        ).start()
 
     def _prepare_runtime(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -418,19 +417,42 @@ class DesktopApp:
         self.run_button.grid(row=0, column=3, padx=(0, 18))
 
     def _stabilize_scroll_edges(self, scroll_frame):
-        """Prevent macOS trackpads from repeatedly bouncing at scroll limits."""
+        """Register a scroll surface for deterministic macOS wheel routing."""
         canvas = getattr(scroll_frame, "_parent_canvas", None)
         if canvas is None:
             return
+        self.scroll_canvases.append(canvas)
 
-        def clamp(_event=None):
+    def _route_mousewheel(self, event):
+        """Route one gesture to one canvas and consume overscroll at the edge."""
+        if not getattr(event, "delta", 0):
+            return "break"
+        pointer_x, pointer_y = self.root.winfo_pointerxy()
+        candidates = []
+        for canvas in self.scroll_canvases:
+            try:
+                left, top = canvas.winfo_rootx(), canvas.winfo_rooty()
+                width, height = canvas.winfo_width(), canvas.winfo_height()
+                if left <= pointer_x <= left + width and top <= pointer_y <= top + height:
+                    candidates.append((width * height, canvas))
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        direction = -1 if event.delta > 0 else 1
+        for _area, canvas in sorted(candidates, key=lambda item: item[0]):
             first, last = canvas.yview()
-            if first < 0.0005:
-                canvas.yview_moveto(0)
-            elif last > 0.9995:
-                canvas.yview_moveto(1)
-        canvas.bind("<ButtonRelease-1>", clamp, add="+")
-        canvas.bind("<MouseWheel>", lambda _event: canvas.after_idle(clamp), add="+")
+            can_move = (direction < 0 and first > 0.0005) or (direction > 0 and last < 0.9995)
+            if can_move:
+                units = max(1, min(3, abs(int(event.delta)) // 30 or 1))
+                canvas.yview_scroll(direction * units, "units")
+                first, last = canvas.yview()
+                if first < 0.0005:
+                    canvas.yview_moveto(0)
+                elif last > 0.9995:
+                    canvas.yview_moveto(1)
+                break
+        return "break"
 
     def _add_friend_row(self, name: str, selected: bool = True):
         row = ctk.CTkFrame(self.friends_list, fg_color="transparent")
@@ -703,7 +725,9 @@ class DesktopApp:
     def _refresh_login_state(self):
         logged_in = STATE_PATH.exists() and bool(self.current_account_id)
         self.login_dot.configure(text_color=GREEN if logged_in else MUTED)
-        self.login_text.configure(text="已登录" if logged_in else "未登录")
+        self.login_text.configure(
+            text=f"已登录 · {self._current_account_name()}" if logged_in else "未登录"
+        )
         self.login_button.configure(text="重新扫码" if logged_in else "扫码登录")
         self.logout_button.configure(state="normal" if logged_in else "disabled")
 
@@ -793,7 +817,7 @@ class DesktopApp:
         )
         self.qr_countdown_label.pack(pady=(8, 0))
         ctk.CTkButton(
-            window, text="保存原始二维码（可传到手机相册识别）",
+            window, text="保存二维码（可选）",
             width=250, height=34, corner_radius=10, fg_color="#FFF4CC",
             hover_color="#FFE79A", text_color="#7A5600",
             command=self._save_qr_image
@@ -914,7 +938,7 @@ class DesktopApp:
                 # 跳过视频、字体和普通图片，保留 JS 与登录接口，显著缩短冷启动。
                 async def route_fast(route):
                     resource_type = route.request.resource_type
-                    if resource_type in {"media", "font", "image"}:
+                    if resource_type in {"media", "font", "image", "stylesheet"}:
                         await route.abort()
                     else:
                         await route.continue_()
@@ -1045,7 +1069,9 @@ class DesktopApp:
 
                 # 登录凭证落盘后立即完成，不再让昵称接口拖慢成功反馈。
                 # 通用名称会由后台回填线程在稍后安全更新。
-                self.pending_account_name = ""
+                self.pending_account_name = await self._resolve_profile_name_fast(
+                    page, context
+                )
             finally:
                 await browser.close()
 
@@ -1083,6 +1109,48 @@ class DesktopApp:
                 if found:
                     return found
         return ""
+
+    async def _resolve_profile_name_fast(self, page, context):
+        """Resolve the nickname concurrently without a slow page navigation."""
+        endpoints = [
+            (
+                "https://www.douyin.com/aweme/v1/web/query/user/"
+                "?device_platform=webapp&aid=6383&channel=channel_pc_web"
+            ),
+            (
+                "https://www.douyin.com/aweme/v1/web/get/user/settings"
+                "?device_platform=webapp&aid=6383"
+            ),
+        ]
+
+        async def query(endpoint):
+            try:
+                response = await context.request.get(endpoint, timeout=2_000)
+                text = (await response.text()).strip()
+                payload = json.loads(text) if text.startswith("{") else {}
+                return self._find_profile_nickname(payload)
+            except Exception:
+                return ""
+
+        names = await asyncio.gather(*(query(endpoint) for endpoint in endpoints))
+        for name in names:
+            if name:
+                return name
+        try:
+            payload = await page.evaluate(
+                """() => {
+                    const node = document.querySelector('#RENDER_DATA');
+                    if (!node || !node.textContent) return {};
+                    const raw = node.textContent.trim();
+                    for (const text of [raw, decodeURIComponent(raw)]) {
+                        try { return JSON.parse(text); } catch (_) {}
+                    }
+                    return {};
+                }"""
+            )
+            return self._find_profile_nickname(payload)
+        except Exception:
+            return ""
 
     async def _resolve_profile_name(self, page, context):
         endpoints = [
@@ -1195,6 +1263,7 @@ class DesktopApp:
             if changed:
                 self._save_account_registry()
                 self.root.after(0, self._refresh_account_menu)
+                self.root.after(0, self._refresh_login_state)
                 self.root.after(
                     0,
                     lambda: self.activity_text.configure(
