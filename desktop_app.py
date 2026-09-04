@@ -79,6 +79,7 @@ class DesktopApp:
         self.qr_label: ctk.CTkLabel | None = None
         self.qr_image = None
         self.daily_plan: list[dict] = []
+        self.daily_plan_date = ""
         self.risk_stopped = False
         self.active_plan_item: dict | None = None
         self.accounts: list[dict] = []
@@ -325,11 +326,12 @@ class DesktopApp:
         )
         self.plan_title.pack(anchor="w", padx=16, pady=(14, 2))
         self.plan_description = ctk.CTkLabel(
-            plan_box, text="01:00–23:00 分段安排，确保当天完成",
+            plan_box, text="01:00–23:00 随机开始，好友间隔 2–5 分钟",
             text_color=MUTED, font=ctk.CTkFont(size=11)
         )
         self.plan_description.pack(anchor="w", padx=16, pady=(0, 10))
         fixed_row = ctk.CTkFrame(plan_box, fg_color="transparent")
+        self.fixed_time_row = fixed_row
         fixed_row.pack(fill="x", padx=16, pady=(0, 14))
         ctk.CTkLabel(
             fixed_row, text="固定开始时间", text_color=MUTED, font=ctk.CTkFont(size=11)
@@ -354,9 +356,10 @@ class DesktopApp:
         self.fixed_hour_entry.pack(side="right")
 
         switch_row = ctk.CTkFrame(schedule_card, fg_color="transparent")
+        self.random_switch_row = switch_row
         switch_row.pack(fill="x", padx=24, pady=(2, 20))
         ctk.CTkLabel(
-            switch_row, text="启用每日智能计划", text_color=INK,
+            switch_row, text="启动每日智能计划", text_color=INK,
             font=ctk.CTkFont(size=13, weight="bold")
         ).pack(side="left")
         self.schedule_enabled = ctk.BooleanVar(value=False)
@@ -550,6 +553,7 @@ class DesktopApp:
         self.fixed_hour.set("21")
         self.fixed_minute.set("00")
         self.daily_plan = []
+        self.daily_plan_date = ""
         self._plan_mode_changed("随机时间", save=False)
         self._render_target_status()
 
@@ -1527,11 +1531,18 @@ class DesktopApp:
         state = "normal" if fixed else "disabled"
         self.fixed_hour_entry.configure(state=state)
         self.fixed_minute_entry.configure(state=state)
-        self.plan_title.configure(text="每天按固定时间开始" if fixed else "每天自动生成分散时间")
+        self.plan_title.configure(text="每天按固定时间开始" if fixed else "每天随机选择开始时间")
         self.plan_description.configure(
-            text="从设定时间开始，好友之间仍保留自然间隔"
-            if fixed else "01:00–23:00 分段安排，确保当天完成"
+            text="到设定时间自动开始，好友之间间隔 2–5 分钟"
+            if fixed else "01:00–23:00 随机开始，好友之间间隔 2–5 分钟"
         )
+        if fixed:
+            self.fixed_time_row.pack(fill="x", padx=16, pady=(0, 14))
+            self.random_switch_row.pack_forget()
+            self.schedule_enabled.set(False)
+        else:
+            self.fixed_time_row.pack_forget()
+            self.random_switch_row.pack(fill="x", padx=24, pady=(2, 20))
         if save and hasattr(self, "schedule_enabled"):
             self._ensure_daily_plan(force=True)
             self._save_settings_only()
@@ -1554,6 +1565,9 @@ class DesktopApp:
         self._save_settings_only()
         self._render_target_status()
 
+    def _schedule_active(self):
+        return self.plan_mode.get() == "固定时间" or self.schedule_enabled.get()
+
     def _save_settings_only(self):
         SETTINGS_PATH.write_text(json.dumps({
             "schedule_enabled": self.schedule_enabled.get(),
@@ -1568,22 +1582,34 @@ class DesktopApp:
     def _load_daily_plan(self):
         status_path = self._daily_status_path()
         if not status_path.exists():
+            self.daily_plan = []
+            self.daily_plan_date = ""
             return
         try:
             payload = json.loads(status_path.read_text(encoding="utf-8"))
             if payload.get("date") == datetime.now().strftime("%Y-%m-%d"):
+                self.daily_plan_date = payload.get("date", "")
                 self.daily_plan = payload.get("items", [])
                 self.risk_stopped = bool(payload.get("risk_stopped", False))
+            else:
+                self.daily_plan = []
+                self.daily_plan_date = ""
         except Exception:
             self.daily_plan = []
+            self.daily_plan_date = ""
 
     def _ensure_daily_plan(self, force: bool = False):
         friends = self._friend_values()
         today = datetime.now().strftime("%Y-%m-%d")
         existing_names = [item.get("friend") for item in self.daily_plan]
-        if not force and self.daily_plan and existing_names == friends:
+        if (not force and self.daily_plan_date == today
+                and self.daily_plan and existing_names == friends):
             return
         now = datetime.now()
+        previous = {
+            item.get("friend"): item for item in self.daily_plan
+            if self.daily_plan_date == today and item.get("status") == "success"
+        }
         if self.plan_mode.get() == "固定时间":
             fixed = datetime.strptime(self._fixed_time_value(), "%H:%M")
             start = now.replace(hour=fixed.hour, minute=fixed.minute, second=0, microsecond=0)
@@ -1595,32 +1621,45 @@ class DesktopApp:
                 slots.append(cursor)
                 cursor += random.randint(120, 300)
         else:
-            start = now.replace(hour=1, minute=0, second=0, microsecond=0)
+            earliest = now.replace(hour=1, minute=0, second=0, microsecond=0)
             end = now.replace(hour=23, minute=0, second=0, microsecond=0)
-            if now > start:
-                start = now + timedelta(minutes=5)
-            if start >= end:
-                start = (now + timedelta(days=1)).replace(
+            if now >= end:
+                earliest = (now + timedelta(days=1)).replace(
                     hour=1, minute=0, second=0, microsecond=0
                 )
-                end = start.replace(hour=23)
-            span = max(1, int((end - start).total_seconds()))
-            count = len(friends)
-            bucket = span / max(1, count)
-            slots = [min(span - 1, int(i * bucket + random.uniform(bucket * 0.18, bucket * 0.82)))
-                     for i in range(count)]
-        self.daily_plan = [{
-            "friend": friend,
-            "time": (start + timedelta(seconds=slots[i])).isoformat(timespec="seconds"),
-            "status": "pending",
-            "error": "",
-        } for i, friend in enumerate(friends)]
+                end = earliest.replace(hour=23)
+            elif now > earliest:
+                earliest = now + timedelta(minutes=2)
+            reserve = max(0, len(friends) - 1) * 300
+            latest_start = max(earliest, end - timedelta(seconds=reserve))
+            start = earliest + timedelta(
+                seconds=random.randint(0, max(0, int((latest_start - earliest).total_seconds())))
+            )
+            slots = []
+            cursor = 0
+            for _ in friends:
+                slots.append(cursor)
+                cursor += random.randint(120, 300)
+        generated = []
+        for i, friend in enumerate(friends):
+            if friend in previous:
+                generated.append(previous[friend])
+            else:
+                generated.append({
+                    "friend": friend,
+                    "time": (start + timedelta(seconds=slots[i])).isoformat(timespec="seconds"),
+                    "status": "pending",
+                    "error": "",
+                })
+        self.daily_plan = generated
+        self.daily_plan_date = today
         self.risk_stopped = False
         self._persist_daily_plan(today)
 
     def _persist_daily_plan(self, date: str | None = None):
+        persisted_date = date or self.daily_plan_date or datetime.now().strftime("%Y-%m-%d")
         self._daily_status_path().write_text(json.dumps({
-            "date": date or datetime.now().strftime("%Y-%m-%d"),
+            "date": persisted_date,
             "risk_stopped": self.risk_stopped,
             "items": self.daily_plan,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1631,7 +1670,7 @@ class DesktopApp:
         friends = self._friend_values()
         by_name = {item.get("friend"): item for item in self.daily_plan}
         styles = {
-            "success": ("已完成", "#E8F7EF", "#147A49"),
+            "success": ("今日已发送", "#E8F7EF", "#147A49"),
             "running": ("正在发送", "#FFF4CC", "#8A6300"),
             "failed": ("已停止", "#FDECEC", "#B52E2E"),
             "pending": ("未发送", "#FDECEC", "#B52E2E"),
@@ -1655,7 +1694,7 @@ class DesktopApp:
         while True:
             try:
                 today = datetime.now().strftime("%Y-%m-%d")
-                if self.schedule_enabled.get() and STATE_PATH.exists() and not self.risk_stopped:
+                if self._schedule_active() and STATE_PATH.exists() and not self.risk_stopped:
                     self._ensure_daily_plan()
                     due = next((item for item in self.daily_plan
                                 if item.get("status") == "pending"
