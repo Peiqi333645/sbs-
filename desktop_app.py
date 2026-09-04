@@ -744,7 +744,26 @@ class DesktopApp:
         if self.busy:
             return
         self.pending_new_account = True
-        self.start_qr_login()
+        self._open_qr_window()
+        self._set_busy(True, "获取新账号二维码")
+        # 添加账号必须使用全新二维码会话，不能复用启动时的预取会话。
+        if self.qr_worker_active:
+            self.qr_cancel_event.set()
+            self.root.after(100, self._start_fresh_account_qr)
+        else:
+            self._start_fresh_account_qr()
+
+    def _start_fresh_account_qr(self):
+        if not self.pending_new_account:
+            return
+        if self.qr_worker_active:
+            self.root.after(100, self._start_fresh_account_qr)
+            return
+        self.qr_cancel_event.clear()
+        self.qr_prefetch_ready.clear()
+        self.qr_expires_at = 0.0
+        self.qr_worker_active = True
+        threading.Thread(target=self._qr_login_worker, daemon=True).start()
 
     def _begin_qr_prefetch(self):
         if self.qr_worker_active:
@@ -968,11 +987,12 @@ class DesktopApp:
                             data.get("qrcode") or data.get("qr_code") or ""
                         )
                         if token and qr_value:
-                            raw_expiry = data.get("expires_in") or data.get("expire_seconds") or 240
+                            raw_expiry = data.get("expires_in") or data.get("expire_seconds") or 180
                             try:
-                                expiry_seconds = max(1, min(600, int(raw_expiry)))
+                                # UI 最多显示 3 分钟；服务端可随时提前判定失效。
+                                expiry_seconds = max(1, min(180, int(raw_expiry)))
                             except (TypeError, ValueError):
-                                expiry_seconds = 240
+                                expiry_seconds = 180
                             qr_future.set_result((qr_value, expiry_seconds))
                         return
                     if "check_qrconnect" in url:
@@ -990,7 +1010,8 @@ class DesktopApp:
                                 or data.get("redirectUrl")
                                 or ""
                             )
-                        elif status == 5 and not confirmed_future.done():
+                        elif status in {4, 5} and not confirmed_future.done():
+                            self.root.after(0, self._mark_qr_expired)
                             confirmed_future.set_exception(
                                 RuntimeError("二维码已过期，请重新获取")
                             )
@@ -1089,6 +1110,15 @@ class DesktopApp:
         if self.qr_label and self.qr_label.winfo_exists():
             self.qr_label.configure(text="已扫码，请在手机上确认登录", text_color=GREEN)
         self.activity_text.configure(text="已扫码，等待手机确认")
+
+    def _mark_qr_expired(self):
+        self.qr_expires_at = time.monotonic()
+        if (hasattr(self, "qr_countdown_label")
+                and self.qr_countdown_label.winfo_exists()):
+            self.qr_countdown_label.configure(
+                text="抖音已判定二维码失效，请重新获取",
+                text_color=RED,
+            )
 
 
     def _show_qr_image(self):
