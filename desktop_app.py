@@ -90,6 +90,7 @@ class DesktopApp:
         self.qr_prefetch_ready = threading.Event()
         self.qr_worker_active = False
         self.qr_session_id = 0
+        self.qr_scanned = False
         self.qr_expires_at = 0.0
         self.qr_countdown_job = None
         self.friend_rows: list[dict] = []
@@ -767,6 +768,7 @@ class DesktopApp:
 
     def _launch_qr_worker(self):
         self.qr_session_id += 1
+        self.qr_scanned = False
         session_id = self.qr_session_id
         self.qr_worker_active = True
         threading.Thread(
@@ -852,6 +854,15 @@ class DesktopApp:
             font=ctk.CTkFont(size=13),
         )
         self.qr_label.pack(expand=True)
+
+        self.qr_status_label = ctk.CTkLabel(
+            window,
+            text="正在连接抖音登录服务…",
+            height=28,
+            text_color=MUTED,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.qr_status_label.pack(pady=(0, 4))
 
         ctk.CTkLabel(
             window,
@@ -1155,15 +1166,20 @@ class DesktopApp:
 
 
     def _show_scanned_hint(self):
-        if self.qr_label and self.qr_label.winfo_exists():
-            self.qr_label.configure(text="已扫码，请在手机上确认登录", text_color=GREEN)
-        self.activity_text.configure(text="已扫码，等待手机确认")
+        self.qr_scanned = True
+        if (hasattr(self, "qr_status_label")
+                and self.qr_status_label.winfo_exists()):
+            self.qr_status_label.configure(
+                text="已扫码，等待抖音返回确认结果",
+                text_color=GREEN,
+            )
+        self.activity_text.configure(text="已扫码；手机确认后等待抖音完成授权")
 
     def _mark_qr_expired(self):
         self.qr_expires_at = time.monotonic()
-        if (hasattr(self, "qr_countdown_label")
-                and self.qr_countdown_label.winfo_exists()):
-            self.qr_countdown_label.configure(
+        if (hasattr(self, "qr_status_label")
+                and self.qr_status_label.winfo_exists()):
+            self.qr_status_label.configure(
                 text="抖音已判定二维码失效，请重新获取",
                 text_color=RED,
             )
@@ -1178,6 +1194,9 @@ class DesktopApp:
         canvas.paste(image, ((300 - image.width) // 2, (320 - image.height) // 2))
         self.qr_image = ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(300, 320))
         self.qr_label.configure(image=self.qr_image, text="")
+        if (hasattr(self, "qr_status_label")
+                and self.qr_status_label.winfo_exists()):
+            self.qr_status_label.configure(text="等待扫码", text_color=MUTED)
         self._update_qr_countdown()
 
     @staticmethod
@@ -1463,7 +1482,12 @@ class DesktopApp:
             ).start()
 
     def _login_error(self, error: str):
-        if self.qr_label and self.qr_label.winfo_exists():
+        if self.qr_scanned and "过期" in error:
+            error = "已扫码，但抖音服务器未返回确认授权；请重新生成二维码"
+        if (hasattr(self, "qr_status_label")
+                and self.qr_status_label.winfo_exists()):
+            self.qr_status_label.configure(text=error, text_color=RED)
+        elif self.qr_label and self.qr_label.winfo_exists():
             self.qr_label.configure(text=error, image=None)
         self.activity_text.configure(text="登录失败，请重试")
 
