@@ -20,7 +20,7 @@ from tkinter import filedialog, messagebox
 from playwright.async_api import async_playwright
 
 from app.main import run
-from app.browser import AuthenticationError, RiskControlError
+from app.browser import AuthenticationError, RiskControlError, open_private_messages
 
 
 APP_NAME = "SBS Spark"
@@ -76,6 +76,8 @@ class DesktopApp:
         self.busy = False
         self.last_schedule_day = ""
         self.login_window: ctk.CTkToplevel | None = None
+        self.import_window: ctk.CTkToplevel | None = None
+        self.import_textbox: ctk.CTkTextbox | None = None
         self.qr_label: ctk.CTkLabel | None = None
         self.qr_image = None
         self.daily_plan: list[dict] = []
@@ -194,7 +196,7 @@ class DesktopApp:
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=1)
 
-        login_card = self._card(body, 0, 0, "01", "账号登录", "扫码后登录状态仅保存在本机")
+        login_card = self._card(body, 0, 0, "01", "账号登录", "支持二维码或本地 Cookie / JSON，凭证仅保存在本机")
         account_row = ctk.CTkFrame(login_card, fg_color="#FAFAF8", corner_radius=12)
         account_row.pack(fill="x", padx=22, pady=(4, 10))
         ctk.CTkLabel(
@@ -246,6 +248,13 @@ class DesktopApp:
             command=self.start_qr_login,
         )
         self.login_button.pack(side="right")
+        self.import_login_button = ctk.CTkButton(
+            login_row, text="Cookie / JSON", width=112, height=38,
+            corner_radius=12, fg_color="#FFF4CC", hover_color="#FFE79A",
+            text_color="#7A5600", font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._open_import_login,
+        )
+        self.import_login_button.pack(side="right", padx=(0, 8))
         self.logout_button = ctk.CTkButton(
             login_row,
             text="退出",
@@ -805,6 +814,199 @@ class DesktopApp:
         self.qr_cancel_event.clear()
         self.qr_prefetch_ready.clear()
         self._launch_qr_worker()
+
+    def _open_import_login(self):
+        if self.busy:
+            return
+        if self.import_window and self.import_window.winfo_exists():
+            self.import_window.focus_force()
+            return
+        window = ctk.CTkToplevel(self.root)
+        self.import_window = window
+        window.title("Cookie / JSON 登录")
+        window.geometry("600x500")
+        window.minsize(540, 440)
+        window.configure(fg_color=CANVAS)
+        window.transient(self.root)
+        ctk.CTkLabel(
+            window, text="导入抖音登录凭证", text_color=INK,
+            font=ctk.CTkFont(size=21, weight="bold"),
+        ).pack(pady=(24, 5))
+        ctk.CTkLabel(
+            window,
+            text="支持 Cookie-Editor 导出的 JSON、Playwright storage state，或 Cookie 请求头文本",
+            text_color=MUTED, font=ctk.CTkFont(size=11),
+        ).pack()
+        self.import_textbox = ctk.CTkTextbox(
+            window, height=285, corner_radius=12, border_width=1,
+            border_color=BORDER, fg_color="#FFFFFF", text_color=INK,
+            font=ctk.CTkFont(size=12), wrap="word",
+        )
+        self.import_textbox.pack(fill="both", expand=True, padx=26, pady=(18, 10))
+        ctk.CTkLabel(
+            window,
+            text="凭证等同于登录密码。仅导入账号本人授权提供的内容，验证失败不会覆盖当前账号。",
+            text_color=RED, font=ctk.CTkFont(size=11),
+        ).pack(padx=26, pady=(0, 10))
+        actions = ctk.CTkFrame(window, fg_color="transparent")
+        actions.pack(fill="x", padx=26, pady=(0, 20))
+        ctk.CTkButton(
+            actions, text="选择 JSON 文件", width=130, height=38,
+            corner_radius=11, fg_color="#EFEFED", hover_color="#E2E2DE",
+            text_color=INK, command=self._load_auth_file,
+        ).pack(side="left")
+        ctk.CTkButton(
+            actions, text="取消", width=80, height=38, corner_radius=11,
+            fg_color="#EFEFED", hover_color="#E2E2DE", text_color=INK,
+            command=window.destroy,
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            actions, text="验证并登录", width=120, height=38, corner_radius=11,
+            fg_color=YELLOW, hover_color=YELLOW_HOVER, text_color=INK,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_import_login,
+        ).pack(side="right")
+
+    def _load_auth_file(self):
+        path = filedialog.askopenfilename(
+            title="选择 Cookie / storage-state JSON",
+            filetypes=[("JSON 文件", "*.json"), ("文本文件", "*.txt"), ("所有文件", "*")],
+        )
+        if not path or not self.import_textbox:
+            return
+        try:
+            content = Path(path).read_text(encoding="utf-8-sig")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"无法读取文件：{exc}")
+            return
+        self.import_textbox.delete("1.0", "end")
+        self.import_textbox.insert("1.0", content)
+
+    @staticmethod
+    def _parse_imported_auth(raw: str):
+        raw = raw.strip()
+        if not raw:
+            raise ValueError("请粘贴凭证或选择 JSON 文件")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            cookies = []
+            for item in raw.split(";"):
+                if "=" not in item:
+                    continue
+                name, value = item.strip().split("=", 1)
+                if name:
+                    cookies.append({"name": name, "value": value, "domain": ".douyin.com", "path": "/"})
+            if not cookies:
+                raise ValueError("内容不是有效 JSON 或 Cookie 请求头")
+            return cookies
+        if isinstance(payload, dict) and isinstance(payload.get("cookies"), list):
+            return {"cookies": payload["cookies"], "origins": payload.get("origins", [])}
+        if isinstance(payload, list):
+            return payload
+        raise ValueError("JSON 必须是 Cookie 数组或包含 cookies 的 storage state 对象")
+
+    @staticmethod
+    def _normalize_imported_cookies(cookies):
+        normalized = []
+        same_site_map = {"strict": "Strict", "lax": "Lax", "none": "None", "no_restriction": "None"}
+        for item in cookies:
+            if not isinstance(item, dict):
+                continue
+            name, value = str(item.get("name", "")).strip(), str(item.get("value", ""))
+            if not name:
+                continue
+            cookie = {"name": name, "value": value}
+            if item.get("url"):
+                cookie["url"] = str(item["url"])
+            else:
+                cookie["domain"] = str(item.get("domain") or ".douyin.com")
+                cookie["path"] = str(item.get("path") or "/")
+            expires = item.get("expires", item.get("expirationDate"))
+            try:
+                if expires is not None and float(expires) > 0:
+                    cookie["expires"] = float(expires)
+            except (TypeError, ValueError):
+                pass
+            for key in ("httpOnly", "secure"):
+                if key in item:
+                    cookie[key] = bool(item[key])
+            same_site = same_site_map.get(str(item.get("sameSite", "")).lower())
+            if same_site:
+                cookie["sameSite"] = same_site
+            normalized.append(cookie)
+        if not normalized:
+            raise ValueError("没有找到可导入的 Cookie")
+        return normalized
+
+    def _start_import_login(self):
+        if self.busy or not self.import_textbox:
+            return
+        try:
+            payload = self._parse_imported_auth(self.import_textbox.get("1.0", "end"))
+        except ValueError as exc:
+            messagebox.showwarning(APP_NAME, str(exc))
+            return
+        self.pending_new_account = True
+        self.pending_account_name = ""
+        self._set_busy(True, "验证登录凭证")
+        self.activity_text.configure(text="正在验证 Cookie / JSON，验证成功后才会保存")
+        threading.Thread(target=self._import_login_worker, args=(payload,), daemon=True).start()
+
+    def _import_login_worker(self, payload):
+        try:
+            asyncio.run(self._verify_and_save_import(payload))
+            self.root.after(0, self._import_login_success)
+        except Exception as exc:
+            tmp = STATE_PATH.with_suffix(".import.tmp")
+            if tmp.exists():
+                tmp.unlink()
+            self.root.after(0, lambda error=str(exc): self._import_login_error(error))
+        finally:
+            self._set_busy(False, "空闲")
+
+    async def _verify_and_save_import(self, payload):
+        tmp = STATE_PATH.with_suffix(".import.tmp")
+        if tmp.exists():
+            tmp.unlink()
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                if isinstance(payload, dict):
+                    storage_state = {
+                        "cookies": self._normalize_imported_cookies(payload["cookies"]),
+                        "origins": payload.get("origins", []),
+                    }
+                    context = await browser.new_context(
+                        storage_state=storage_state, locale="zh-CN",
+                        viewport={"width": 1280, "height": 800},
+                    )
+                else:
+                    context = await browser.new_context(locale="zh-CN", viewport={"width": 1280, "height": 800})
+                    await context.add_cookies(self._normalize_imported_cookies(payload))
+                try:
+                    page = await context.new_page()
+                    await open_private_messages(page, timeout_ms=8_000)
+                    self.pending_account_name = await self._resolve_profile_name_fast(page, context)
+                    await context.storage_state(path=str(tmp))
+                finally:
+                    await context.close()
+            finally:
+                await browser.close()
+        if not tmp.exists():
+            raise RuntimeError("登录状态未能保存")
+        tmp.replace(STATE_PATH)
+
+    def _import_login_success(self):
+        if self.import_window and self.import_window.winfo_exists():
+            self.import_window.destroy()
+        self._login_success()
+
+    def _import_login_error(self, error: str):
+        self.pending_new_account = False
+        self.pending_account_name = ""
+        self.activity_text.configure(text="Cookie / JSON 验证失败，当前账号未改变")
+        messagebox.showerror(APP_NAME, f"登录失败：{error}\n\n请确认凭证来自已登录的 douyin.com，并且尚未过期。")
 
     def _restart_cancelled_qr(self):
         if not self.login_window or not self.login_window.winfo_exists():
@@ -1878,6 +2080,7 @@ class DesktopApp:
             self.run_button.configure(state=state)
             self.test_button.configure(state=state)
             self.login_button.configure(state=state)
+            self.import_login_button.configure(state=state)
 
         self.root.after(0, update)
 
