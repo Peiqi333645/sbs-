@@ -107,7 +107,8 @@ class DesktopApp:
         self._refresh_login_state()
         self._render_target_status()
         threading.Thread(target=self._scheduler_loop, daemon=True).start()
-        self._begin_qr_prefetch()
+        # 登录必须使用可见浏览器，以便扫码账号遇到短信或安全验证时能够继续。
+        # 不在启动时预取，避免创建一个用户看不到、无法完成验证的无头会话。
 
     def _prepare_runtime(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1039,7 +1040,7 @@ class DesktopApp:
         ).pack(pady=(28, 5))
         ctk.CTkLabel(
             window,
-            text="请在手机上完成登录确认",
+            text="请在手机上确认；如弹出短信/安全验证，请在浏览器中完成",
             text_color=MUTED,
             font=ctk.CTkFont(size=12),
         ).pack()
@@ -1192,17 +1193,18 @@ class DesktopApp:
             return ""
 
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            browser = await playwright.chromium.launch(headless=False)
             context = await browser.new_context(
                 locale="zh-CN",
                 user_agent=headers["User-Agent"],
                 viewport={"width": 1280, "height": 800},
             )
             try:
-                # 跳过视频、字体和普通图片，保留 JS 与登录接口，显著缩短冷启动。
+                # 跳过视频、字体和普通图片，保留 JS、样式与登录接口。
+                # 样式必须保留，否则短信/安全验证页面虽然存在但难以操作。
                 async def route_fast(route):
                     resource_type = route.request.resource_type
-                    if resource_type in {"media", "font", "image", "stylesheet"}:
+                    if resource_type in {"media", "font", "image"}:
                         await route.abort()
                     else:
                         await route.continue_()
@@ -1245,6 +1247,8 @@ class DesktopApp:
                                 or data.get("redirectUrl")
                                 or ""
                             )
+                            if session_id == self.qr_session_id:
+                                self.root.after(0, self._show_confirmed_hint)
                         elif status in {"4", "5", "expired"} and not confirmed_future.done():
                             if session_id == self.qr_session_id:
                                 self.root.after(0, self._mark_qr_expired)
@@ -1305,6 +1309,7 @@ class DesktopApp:
                 deadline = self.qr_expires_at
                 redirect_url = ""
                 confirmation_handled = False
+                fast_route_removed = False
                 while time.monotonic() < deadline:
                     if self.qr_cancel_event.is_set() or session_id != self.qr_session_id:
                         raise RuntimeError("登录已取消")
@@ -1312,6 +1317,12 @@ class DesktopApp:
                     if confirmed_future.done() and not confirmation_handled:
                         redirect_url = confirmed_future.result()
                         confirmation_handled = True
+                        # 二维码在确认后即使到期，仍需给抖音足够时间下发 Cookie，
+                        # 并允许用户在真实浏览器里完成短信或安全验证。
+                        deadline = max(deadline, time.monotonic() + 120)
+                        if not fast_route_removed:
+                            await context.unroute("**/*", route_fast)
+                            fast_route_removed = True
                     cookies = await context.cookies()
                     authenticated = any(
                         cookie.get("name") in {
@@ -1323,6 +1334,14 @@ class DesktopApp:
                         for cookie in cookies
                     )
                     if authenticated:
+                        if session_id == self.qr_session_id:
+                            self.root.after(0, self._show_verifying_hint)
+                        if not fast_route_removed:
+                            await context.unroute("**/*", route_fast)
+                            fast_route_removed = True
+                        # Cookie 存在仍不等于可用。必须在同一会话实际进入私信页，
+                        # 检测到好友搜索框后才允许保存并显示登录成功。
+                        await open_private_messages(page, timeout_ms=8_000)
                         tmp = STATE_PATH.with_suffix(".tmp")
                         await context.storage_state(path=str(tmp))
                         tmp.replace(STATE_PATH)
@@ -1339,24 +1358,16 @@ class DesktopApp:
                         except Exception:
                             pass
                         redirect_url = ""
-                        # 抖音已返回确认成功。跳转只执行一次，等待浏览器写入
-                        # Cookie/localStorage 后保存完整状态，不再依赖旧 Cookie 名。
-                        await page.wait_for_timeout(1_000)
-                        tmp = STATE_PATH.with_suffix(".tmp")
-                        await context.storage_state(path=str(tmp))
-                        tmp.replace(STATE_PATH)
-                        break
-                    if confirmation_handled:
-                        await page.wait_for_timeout(1_000)
-                        tmp = STATE_PATH.with_suffix(".tmp")
-                        await context.storage_state(path=str(tmp))
-                        tmp.replace(STATE_PATH)
-                        break
+                        # 跳转只负责继续抖音授权流程，绝不能把“已确认”直接
+                        # 当作“已登录”。继续等待有效 Cookie 和私信页验证。
                     await page.wait_for_timeout(200)
                 else:
-                    raise RuntimeError(
-                        "扫码确认后仍未完成登录，请在抖音 App 内完成验证后重试"
-                    )
+                    if confirmation_handled:
+                        raise RuntimeError(
+                            "手机已确认，但抖音未向当前浏览器下发有效登录状态；"
+                            "请检查浏览器中的短信或安全验证"
+                        )
+                    raise RuntimeError("二维码已过期或未完成扫码确认，请重新获取")
 
                 # 登录凭证落盘后立即完成，不再让昵称接口拖慢成功反馈。
                 # 通用名称会由后台回填线程在稍后安全更新。
@@ -1376,6 +1387,24 @@ class DesktopApp:
                 text_color=GREEN,
             )
         self.activity_text.configure(text="已扫码；手机确认后等待抖音完成授权")
+
+    def _show_confirmed_hint(self):
+        if (hasattr(self, "qr_status_label")
+                and self.qr_status_label.winfo_exists()):
+            self.qr_status_label.configure(
+                text="手机已确认，正在等待登录 Cookie",
+                text_color="#8A6300",
+            )
+        self.activity_text.configure(text="手机已确认；如浏览器要求短信验证，请继续完成")
+
+    def _show_verifying_hint(self):
+        if (hasattr(self, "qr_status_label")
+                and self.qr_status_label.winfo_exists()):
+            self.qr_status_label.configure(
+                text="已收到登录状态，正在验证私信页面",
+                text_color=GREEN,
+            )
+        self.activity_text.configure(text="已收到 Cookie，正在确认私信功能可用")
 
     def _mark_qr_expired(self):
         self.qr_expires_at = time.monotonic()
